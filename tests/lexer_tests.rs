@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod tests {
-    // Adjust path if needed, e.g., `crate::lexer::*` if lexer.rs is in src/lexer/mod.rs
+    // Adjust path if needed, e.g., TEST
     use c4_rust_team_shawkah::lexer::{Lexer, Token, LexerError};
 
     // Helper function to collect all tokens or the first error

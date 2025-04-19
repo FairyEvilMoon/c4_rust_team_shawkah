@@ -1,4 +1,4 @@
-# C4 Compiler Rewrite in Rust (c4_rust_team_shawkah)
+# C4 Compiler Rewrite in Rust
 
 This project is a rewrite of the original ["C in 4 Functions" (C4)](https://github.com/rswier/c4) compiler from C to Rust. It aims to maintain functional equivalence with the original, including its self-hosting capability, while leveraging Rust's safety features and modern programming idioms.
 

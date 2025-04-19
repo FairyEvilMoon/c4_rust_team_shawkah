@@ -1,0 +1,25 @@
+/target
+
+Cargo.lock
+
+# Editor directories and files
+.idea/
+.vscode/
+*.iml
+*.ipr
+*.iws
+.DS_Store
+
+# Build artifacts
+*.o
+*.so
+*.a
+*.dll
+*.dylib
+*.exe
+*.out
+
+.env
+
+# Documentation folder for later
+# /docs/

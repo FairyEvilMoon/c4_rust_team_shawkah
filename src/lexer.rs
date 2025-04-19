@@ -1,5 +1,4 @@
-//! Lexer (Tokenizer) for the C4 subset of C - Stage 4: Literals
-
+//! Lexer (Tokenizer) for the C4 subset of C
 use std::iter::Peekable;
 use std::str::Chars;
 

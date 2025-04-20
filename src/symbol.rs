@@ -68,7 +68,119 @@ pub struct SymbolEntry {
 
     // Handling shadowing/local scopes
     pub shadowed_class: Option<SymbolClass>,
+    pub shadowed_type: Option<DataType>,
     pub shadowed_value: Option<i64>,
     pub shadowed_scope_level: Option<usize>,
-    pub shadowed_type: Option<DataType>,
+}
+
+// Symbol Table Implementation
+#[derive(Debug, Clone)]
+pub struct SymbolTable {
+    symbols: Vec<SymbolEntry>, // Vector of symbols
+    current_scope: usize,
+}
+
+impl SymbolTable {
+    pub fn new() -> Self {
+        SymbolTable {
+            symbols: Vec::new(),
+            current_scope: 0,
+        }
+    }
+
+    pub fn enter_scope(&mut self) {
+        self.current_scope += 1;
+    }
+    pub fn leave_scope(&mut self) {
+        if self.current_scope > 0 {
+            // Restore shadowed symbols
+            self.symbols.retain_mut(|entry| {
+                if entry.scope_level == self.current_scope {
+                    // This symbol is going out of scope. If it shadowed something, restore it.
+                    if let Some(s_class) = entry.shadowed_class {
+                        entry.class = s_class;
+                        entry.data_type = entry.shadowed_type.clone().unwrap(); // Should exist if class does
+                        entry.value = entry.shadowed_value.unwrap();
+                        entry.scope_level = entry.shadowed_scope_level.unwrap();
+                        // Clear shadowing info
+                        entry.shadowed_class = None;
+                        entry.shadowed_type = None;
+                        entry.shadowed_value = None;
+                        entry.shadowed_scope_level = None;
+                        true // Keep the restored entry
+                    } else {
+                         false // Remove the entry entirely if it didn't shadow anything
+                    }
+                } else {
+                    true // Keep symbols from outer scopes
+                }
+            });
+            self.current_scope -= 1;
+        }
+    }
+
+    // Add a new symbol to the table or shadow an existing one
+    pub fn add(
+        &mut self,
+        name: String,
+        token: Token,
+        class: SymbolClass,
+        data_type: DataType,
+        value: i64,
+    ) -> Result<&mut SymbolEntry, String> {
+        // Check for existing symbol in the current scope
+        if let Some(existing) = self.find_in_scope(&name, self.current_scope) {
+            // Allow shadowing globals, but not redeclaring locals/params in the same scope
+            if existing.scope_level == self.current_scope {
+                return Err(format!("Redeclaration of symbol '{}' in the same scope", name));
+            }
+            // Shadowing: save the old symbol's class, value, and scope level
+            let entry = self.find_mut(&name).unwrap();
+            entry.shadowed_class = Some(entry.class);
+            entry.shadowed_type = Some(entry.data_type.clone());
+            entry.shadowed_value = Some(entry.value);
+            entry.shadowed_scope_level = Some(entry.scope_level);
+            entry.class = class;
+            entry.data_type = data_type;
+            entry.value = value;
+            entry.scope_level = self.current_scope;
+            entry.token = token;
+            Ok(entry)
+        } else {
+            // New symbol: add it to the table
+            let entry = SymbolEntry {
+                name,
+                token,
+                class,
+                data_type,
+                value,
+                scope_level: self.current_scope,
+                shadowed_class: None,
+                shadowed_type: None,
+                shadowed_value: None,
+                shadowed_scope_level: None,
+            };
+            self.symbols.push(entry);
+            Ok(self.symbols.last_mut().unwrap())
+        }
+    }
+    // Find a symbol searching from current scope outwards
+    pub fn find(&self, name: &str) -> Option<&SymbolEntry> {
+        self.symbols.iter().rfind(|entry| entry.name == name)
+    }
+
+    // Find a symbol mutable, searching from current scope outwards
+    pub fn find_mut(&mut self, name: &str) -> Option<&mut SymbolEntry> {
+        self.symbols.iter_mut().rfind(|entry| entry.name == name)
+    }
+
+    // Find a symbol in a specific scope only
+    pub fn find_in_scope(&self, name: &str, scope: usize) -> Option<&SymbolEntry> {
+        self.symbols.iter().find(|entry| entry.name == name && entry.scope_level == scope)
+    }
+
+    // Get all symbols in the current scope
+    pub fn get_current_scope(&self) -> usize {
+        self.current_scope
+    }
 }

@@ -51,3 +51,52 @@ fn token_precedence(token: &Token) -> Precedence {
     }
 
 }
+
+// Define Parser errors
+#[derive(Debug, Clone, PartialEq)]
+pub enum ParserError {
+    LexerError(LexerError),
+    UnexpectedToken(Token, String),
+    UnexpectedEOF,
+    UndefinedSymbol(String),
+    Redefinition(String),
+    NotImplemented(String),
+    TypeError(String),
+    SyntaxError(String),
+    InternalError(String), // For unexpected internal states
+}
+
+// Convert LexerError to ParserError
+impl From<LexerError> for ParserError {
+    fn from(err: LexerError) -> Self {
+        ParserError::LexerError(err)
+    }
+}
+
+// Parser structure
+pub struct Parser<'a> {
+    lexer: Peekable<lexer<'a>>,
+    current_token: Token,
+    code: Vec<i64>, // Vector of instructions
+    symbols: SymbolTable,
+    data_segment: Vec<u8>, // For string literals, etc.
+    main_entry_point: Option<usize>, // Entry point for main function
+
+    // Scope information
+    local_offset: usize, // Offset for local variables
+}
+impl<'a> Parser<'a> {
+    pub fn new(mut lexer: Lexer<'a>) -> Result<Self, ParserError> {
+        let first_token = lexer.next_token()?;
+        Ok(Parser {
+            lexer: lexer.peekable(),
+            current_token: first_token,
+            code: Vec::new(),
+            symbols: SymbolTable::new(),
+            data_segment: Vec::new(),
+            main_entry_point: None,
+            local_offset: 0,
+        })
+    }
+
+}

@@ -99,4 +99,39 @@ impl<'a> Parser<'a> {
         })
     }
 
+    // Token Handling
+    fn consume(&mut self) -> Result<(), ParserError> {
+        if self.current_token == Token::EOF {
+            return Err(ParserError::UnexpectedEOF);
+        }
+        // Advance the lexer before updating the current token
+        let next = self.lexer.next().unwrap_or(Ok(Token::EOF))?;
+        self.current_token = next;
+        Ok(())
+    }
+
+    // Check if the current token matches the expected token
+    fn expect(&mut self, expected: Token) -> Result<(), ParserError> {
+        // Use mem::discriminant to compare enum variants without comparing contained values
+        if mem::discriminant(&self.current_token) == mem::discriminant(&expected) {
+            self.consume()
+        } else {
+            let description = format!("{:?}", expected);
+            Err(ParserError::UnexpectedToken(self.current_token.clone(), description))
+        }
+    }
+
+    // Check if the current token matches
+    fn check(&self, expected: &Token) -> bool {
+        mem::discriminant(&self.current_token) == mem::discriminant(&expected)
+    }
+
+    // Peeks at the next token without consuming the current one
+    fn peek(&mut self) -> Result<&Token, ParserError> {
+        match self.lexer.peek() {
+            Some(Ok(token)) => Ok(token),
+            Some(Err(err)) => Err(ParserError::LexerError(err.clone())),
+            None => Ok(&Token::EOF),
+        }
+    }
 }

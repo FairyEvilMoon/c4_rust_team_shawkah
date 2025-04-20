@@ -167,5 +167,65 @@ impl<'a> Parser<'a> {
         }
     }
 
-    
+    // --- Symbol Table Management ---
+    fn add_global_data(&mut self, bytes: &[u8]) -> usize {
+        let addr = self.data_segment.len();
+        self.data_segment.extend_from_slice(bytes);
+        // Align data segment to word boundary
+        while self.data_segment.len() % mem::size_of::<i64>() != 0 {
+            self.data_segment.push(0);
+        }
+        addr
+    }
+
+    // --- Parsing Functions ---
+
+    // Parse the entire input source code
+    pub fn parse(&mut self) -> Result<(Vec<i64>, Option<usize>, Vec<u8>), ParserError> {
+        self.add_builtins()?; // Add built-in functions (printf, exit, etc.) to the symbol table
+        while self.current_token != Token::EOF {
+            self.parse_global_declaration()?;
+        }
+        
+        if self.main_entry_point.is_none() {
+            return Err(ParserError::UndefinedSymbol("main() function not defined".to_string()));
+        }
+        Ok((self.code.clone(), self.main_entry_point, self.data_segment.clone()))
+    }
+
+    fn add_builtins(&mut self) -> Result<(), ParserError> {
+        // Add keywords first
+        let keywords = [
+            ("char", Token::Char), ("else", Token::Else), ("enum", Token::Enum),
+            ("if", Token::If), ("int", Token::Int), ("return", Token::Return),
+            ("sizeof", Token::Sizeof), ("while", Token::While),
+        ];
+        let builtins = [
+            ("open", Instruction::OPEN), ("read", Instruction::READ), ("close", Instruction::CLOS),
+            ("printf", Instruction::PRTF), ("malloc", Instruction::MALC), ("free", Instruction::FREE),
+            ("memset", Instruction::MSET), ("memcmp", Instruction::MCMP), ("exit", Instruction::EXIT),
+        ];
+        for (name, instr) in builtins.iter() {
+            self.symbols.add(
+                name.to_string(),
+                Token::Ident(name.to_string()),
+                SymbolClass::Sys,
+                DataType::Int,
+                *instr as i64,
+            )?;
+        }
+
+        for (name, token) in keywords.iter() {
+            self.symbols.add(
+                name.to_string(),
+                token.clone(),
+                SymbolClass::Key,
+                DataType::Void,
+                0,
+            )?;
+        }
+
+        Ok(())
+    }
+
 }

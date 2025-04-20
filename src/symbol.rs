@@ -1,9 +1,8 @@
 //! Symbol Table structures for the C4 compiler.
-
 use crate::lexer::Token;
 
 // Type representation
-#[derive(Debug, Clone, PartialEq, Eq, Copy)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DataType {
     Void, // Added for function return types etc.
     Char,
@@ -93,29 +92,32 @@ impl SymbolTable {
     }
     pub fn leave_scope(&mut self) {
         if self.current_scope > 0 {
+            // Read current scope level before the mutable borrow starts
+            let scope_to_remove = self.current_scope;
+
             // Restore shadowed symbols
             self.symbols.retain_mut(|entry| {
-                if entry.scope_level == self.current_scope {
-                    // This symbol is going out of scope. If it shadowed something, restore it.
-                    if let Some(s_class) = entry.shadowed_class {
-                        entry.class = s_class;
-                        entry.data_type = entry.shadowed_type.clone().unwrap(); // Should exist if class does
-                        entry.value = entry.shadowed_value.unwrap();
-                        entry.scope_level = entry.shadowed_scope_level.unwrap();
-                        // Clear shadowing info
-                        entry.shadowed_class = None;
-                        entry.shadowed_type = None;
-                        entry.shadowed_value = None;
-                        entry.shadowed_scope_level = None;
-                        true // Keep the restored entry
-                    } else {
-                         false // Remove the entry entirely if it didn't shadow anything
-                    }
+                if entry.scope_level == scope_to_remove {
+                // This symbol is going out of scope. If it shadowed something, restore it.
+                if let Some(s_class) = entry.shadowed_class {
+                    entry.class = s_class;
+                    entry.data_type = entry.shadowed_type.clone().unwrap();
+                    entry.value = entry.shadowed_value.unwrap();
+                    entry.scope_level = entry.shadowed_scope_level.unwrap();
+                    // Clear shadowing info
+                    entry.shadowed_class = None;
+                    entry.shadowed_type = None;
+                    entry.shadowed_value = None;
+                    entry.shadowed_scope_level = None;
+                    true // Keep the restored entry
                 } else {
-                    true // Keep symbols from outer scopes
+                    false // Remove the entry entirely if it didn't shadow anything
                 }
-            });
-            self.current_scope -= 1;
+            } else {
+                true // Keep symbols from outer scopes
+            }
+        });
+        self.current_scope -= 1;
         }
     }
 

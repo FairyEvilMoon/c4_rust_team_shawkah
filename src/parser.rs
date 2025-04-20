@@ -99,7 +99,7 @@ impl<'a> Parser<'a> {
         })
     }
 
-    // Token Handling
+    // --- Token Handling ---
     fn consume(&mut self) -> Result<(), ParserError> {
         if self.current_token == Token::EOF {
             return Err(ParserError::UnexpectedEOF);
@@ -134,4 +134,38 @@ impl<'a> Parser<'a> {
             None => Ok(&Token::EOF),
         }
     }
+
+    // --- Code Emission Helpers ---
+    
+    // Emit a single instruction
+    #[inline]
+    fn emit(&mut self, instruction: Instruction) {
+        self.code.push(instruction as i64);
+    }
+
+    // Emit an instruction opcode followed by its operand
+    #[inline]
+    fn emit_operand(&mut self, instruction: Instruction, operand: i64) {
+        self.code.push(instruction as i64);
+        self.code.push(operand);
+    }
+
+    // Get the next available code address
+    #[inline]
+    fn next_code_addr(&self) -> usize {
+        self.code.len()
+    }
+
+    // Patch a previously emitted instruction operand (e.g., for jumps)
+    #[inline]
+    fn patch_jump(&mut self, jump_instruction_addr:usize, target_addr: usize) -> Result<(), ParserError> {
+        if jump_instruction_addr + 1 >= self.code.len() {
+            Err(ParserError::InternalError("Invalid jump instruction address".to_string()));
+        } else {
+        self.code[jump_instruction_addr] = target_addr as i64;
+        Ok(())
+        }
+    }
+
+    
 }

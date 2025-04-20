@@ -12,6 +12,12 @@ pub enum Instruction {
     Exit = 3,
     Add = 4,
     Sub = 5,
+    Mul = 6,
+    Div = 7,
+    Mod = 8,
+    Jmp = 9,
+    Jz = 10,
+    Jnz = 11,
 }
 
 impl TryFrom<i32> for Instruction {
@@ -24,6 +30,12 @@ impl TryFrom<i32> for Instruction {
             3 => Ok(Instruction::Exit),
             4 => Ok(Instruction::Add),
             5 => Ok(Instruction::Sub),
+            6 => Ok(Instruction::Mul),
+            7 => Ok(Instruction::Div),
+            8 => Ok(Instruction::Mod),
+            9 => Ok(Instruction::Jmp),
+            10 => Ok(Instruction::Jz),
+            11 => Ok(Instruction::Jnz),
             _ => Err(VmError::InvalidInstruction(value)),
         }
     }
@@ -37,6 +49,8 @@ pub enum VmError {
     StackUnderflow,
     OperandExpected,
     ArithmeticOverflow,
+    InvalidJumpTarget(Value),
+    DivisionByZero,
 }
 
 #[derive(Debug, PartialEq)]
@@ -48,12 +62,14 @@ pub struct VirtualMachine {
     code: Vec<Value>,
     pub stack: Vec<Value>,
     running: bool,
+    code_size: usize, // Store code size for jump validation
 }
 
 impl VirtualMachine {
     pub fn new(code: Vec<Value>) -> Self {
         let stack = vec![0; DEFAULT_MEM_SIZE];
         let initial_sp = stack.len();
+        let code_size = code.len(); // Store code size on creation
         VirtualMachine {
             pc: 0,
             sp: initial_sp,
@@ -62,12 +78,14 @@ impl VirtualMachine {
             code,
             stack,
             running: false,
+            code_size, // Initialize the field
         }
     }
 
     /// Fetches the next value from code memory (instruction or operand). Advances PC.
     fn fetch_value(&mut self) -> Result<Value, VmError> {
-        if self.pc >= self.code.len() {
+        // Use stored code_size for bounds check
+        if self.pc >= self.code_size {
             self.running = false;
             Err(VmError::PcOutOfBounds)
         } else {
@@ -127,6 +145,17 @@ impl VirtualMachine {
         Ok(())
     }
 
+    /// Validates a jump target address, ensuring it's within the code section bounds.
+    fn validate_jump_target(&self, target: Value) -> Result<usize, VmError> {
+        // Check target is non-negative and strictly less than code_size
+        if target < 0 || (target as usize) >= self.code_size {
+            Err(VmError::InvalidJumpTarget(target))
+        } else {
+            Ok(target as usize)
+        }
+    }
+
+
     fn execute(&mut self, instruction: Instruction) -> Result<(), VmError> {
         match instruction {
             Instruction::Nop => { /* Do nothing */ }
@@ -137,19 +166,53 @@ impl VirtualMachine {
                 self.push(self.ax)?;
             }
             Instruction::Exit => {
-                self.running = false; // Signal run loop to stop
+                self.running = false;
             }
             Instruction::Add => {
-                let operand = self.pop()?; // Pop RHS (value previously pushed)
-                // ax = operand (from stack) + ax (current value)
-                // Use checked_add for overflow detection
+                let operand = self.pop()?;
                 self.ax = operand.checked_add(self.ax).ok_or(VmError::ArithmeticOverflow)?;
             }
             Instruction::Sub => {
-                let operand = self.pop()?; // Pop RHS (value previously pushed)
-                // ax = operand (from stack) - ax (current value)
-                // Use checked_sub for overflow detection
+                let operand = self.pop()?;
                 self.ax = operand.checked_sub(self.ax).ok_or(VmError::ArithmeticOverflow)?;
+            }
+            Instruction::Mul => {
+                let operand = self.pop()?;
+                self.ax = operand.checked_mul(self.ax).ok_or(VmError::ArithmeticOverflow)?;
+            }
+            Instruction::Div => {
+                let divisor = self.ax;
+                if divisor == 0 {
+                    return Err(VmError::DivisionByZero);
+                }
+                let dividend = self.pop()?;
+                // Perform division: dividend (from stack) / divisor (from ax)
+                self.ax = dividend.checked_div(divisor).ok_or(VmError::ArithmeticOverflow)?; // Overflow with MIN / -1
+            }
+            Instruction::Mod => {
+                let divisor = self.ax;
+                if divisor == 0 {
+                    return Err(VmError::DivisionByZero);
+                }
+                let dividend = self.pop()?;
+                 // Perform modulo: dividend (from stack) % divisor (from ax)
+                self.ax = dividend.checked_rem(divisor).ok_or(VmError::ArithmeticOverflow)?; // Overflow with MIN % -1
+            }
+            Instruction::Jmp => {
+                let target_addr = self.fetch_operand()?;
+                self.pc = self.validate_jump_target(target_addr)?;
+            }
+            Instruction::Jz => {
+                let target_addr = self.fetch_operand()?;
+                if self.ax == 0 {
+                    self.pc = self.validate_jump_target(target_addr)?;
+                }
+            }
+            Instruction::Jnz => {
+                let target_addr = self.fetch_operand()?;
+                 if self.ax != 0 {
+                    self.pc = self.validate_jump_target(target_addr)?;
+                 }
             }
         }
         Ok(())

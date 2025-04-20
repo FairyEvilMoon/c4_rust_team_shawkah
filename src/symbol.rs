@@ -44,3 +44,31 @@ impl DataType {
         }
     }
 }
+
+// Symbol Class (Variable, Function, etc.)
+#[derive(Debug, Clone, PartialEq, Eq, Copy)]
+pub enum SymbolClass {
+    Num, // Enum for numeric types
+    Fun, // Function
+    Sys, // System function/call
+    Glo, // Global variable
+    Loc, // Local variable
+    Enum, // Enum type
+}
+
+// Represents an entry in the symbol table
+#[derive(Debug, Clone)]
+pub struct SymbolEntry {
+    pub name: String,
+    pub token: Token, // Original token type (Keyword or Id)
+    pub class: SymbolClass, // Class of the symbol (Num, Fun, etc.)
+    pub data_type: DataType, // Type of the symbol (Int, Char, etc.)
+    pub value: i64, // Depends on class: address (Glo), offset (Loc), etc.
+    pub scope_level: usize, // Scope level (0 for global, >0 for local)
+
+    // Handling shadowing/local scopes
+    pub shadowed_class: Option<SymbolClass>,
+    pub shadowed_value: Option<i64>,
+    pub shadowed_scope_level: Option<usize>,
+    pub shadowed_type: Option<DataType>,
+}

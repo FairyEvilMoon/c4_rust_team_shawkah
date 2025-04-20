@@ -1,5 +1,3 @@
-//! Virtual Machine implementation for the C4 subset compiler.
-
 use std::convert::TryFrom;
 
 pub type Value = i32;
@@ -12,7 +10,8 @@ pub enum Instruction {
     Imm = 1,
     Push = 2,
     Exit = 3,
-    // --- Future instructions ---
+    Add = 4,
+    Sub = 5,
 }
 
 impl TryFrom<i32> for Instruction {
@@ -23,6 +22,8 @@ impl TryFrom<i32> for Instruction {
             1 => Ok(Instruction::Imm),
             2 => Ok(Instruction::Push),
             3 => Ok(Instruction::Exit),
+            4 => Ok(Instruction::Add),
+            5 => Ok(Instruction::Sub),
             _ => Err(VmError::InvalidInstruction(value)),
         }
     }
@@ -33,10 +34,12 @@ pub enum VmError {
     InvalidInstruction(Value),
     PcOutOfBounds,
     StackOverflow,
-    StackUnderflow, // Added
-    OperandExpected, // Added
+    StackUnderflow,
+    OperandExpected,
+    ArithmeticOverflow,
 }
 
+#[derive(Debug, PartialEq)]
 pub struct VirtualMachine {
     pub pc: usize,
     pub sp: usize,
@@ -89,7 +92,7 @@ impl VirtualMachine {
     }
 
     /// Pushes a value onto the stack. Decrements SP.
-    pub(crate) fn push(&mut self, value: Value) -> Result<(), VmError> { // Changed to pub(crate) - tests won't call directly
+    pub(crate) fn push(&mut self, value: Value) -> Result<(), VmError> {
         if self.sp == 0 {
             Err(VmError::StackOverflow)
         } else {
@@ -100,9 +103,8 @@ impl VirtualMachine {
     }
 
     /// Pops a value from the stack. Increments SP.
-    #[allow(dead_code)] // Will be used by ADD, SUB etc. later
-    pub(crate) fn pop(&mut self) -> Result<Value, VmError> { // Changed to pub(crate)
-        if self.sp >= self.stack.len() {
+    pub(crate) fn pop(&mut self) -> Result<Value, VmError> {
+        if self.sp >= self.stack.len() { // Use stack.len() for underflow check
             Err(VmError::StackUnderflow)
         } else {
             let value = self.stack[self.sp];
@@ -115,7 +117,8 @@ impl VirtualMachine {
         self.running = true;
         while self.running {
             let instruction = self.fetch_instruction()?; // Fetch first
-            self.execute(instruction)?; // Then execute
+            // Use ? to propagate errors from execute immediately
+            self.execute(instruction)?;
             // Check running flag again in case EXIT occurred
             if !self.running {
                 break;
@@ -128,13 +131,25 @@ impl VirtualMachine {
         match instruction {
             Instruction::Nop => { /* Do nothing */ }
             Instruction::Imm => {
-                self.ax = self.fetch_operand()?; // Fetch operand *after* decoding IMM
+                self.ax = self.fetch_operand()?;
             }
             Instruction::Push => {
-                self.push(self.ax)?; // Push current value of AX
+                self.push(self.ax)?;
             }
             Instruction::Exit => {
                 self.running = false; // Signal run loop to stop
+            }
+            Instruction::Add => {
+                let operand = self.pop()?; // Pop RHS (value previously pushed)
+                // ax = operand (from stack) + ax (current value)
+                // Use checked_add for overflow detection
+                self.ax = operand.checked_add(self.ax).ok_or(VmError::ArithmeticOverflow)?;
+            }
+            Instruction::Sub => {
+                let operand = self.pop()?; // Pop RHS (value previously pushed)
+                // ax = operand (from stack) - ax (current value)
+                // Use checked_sub for overflow detection
+                self.ax = operand.checked_sub(self.ax).ok_or(VmError::ArithmeticOverflow)?;
             }
         }
         Ok(())

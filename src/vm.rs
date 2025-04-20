@@ -3,19 +3,18 @@
 use std::convert::TryFrom;
 
 pub type Value = i32;
-
-const DEFAULT_MEM_SIZE: usize = 1024 * 1024;
+pub const DEFAULT_MEM_SIZE: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i32)]
 pub enum Instruction {
-    Nop,
-    Imm,
-    Push,
-    Exit,
+    Nop = 0,
+    Imm = 1,
+    Push = 2,
+    Exit = 3,
+    // --- Future instructions ---
 }
 
-// Keep pub
 impl TryFrom<i32> for Instruction {
     type Error = VmError;
     fn try_from(value: i32) -> Result<Self, Self::Error> {
@@ -30,27 +29,25 @@ impl TryFrom<i32> for Instruction {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum VmError { 
+pub enum VmError {
     InvalidInstruction(Value),
     PcOutOfBounds,
+    StackOverflow,
+    StackUnderflow, // Added
+    OperandExpected, // Added
 }
 
 pub struct VirtualMachine {
-
     pub pc: usize,
-    pub sp: usize, 
+    pub sp: usize,
     pub bp: usize,
     pub ax: Value,
-
-
     code: Vec<Value>,
-    pub stack: Vec<Value>, 
-
-    running: bool, // Internal state, likely keep private
+    pub stack: Vec<Value>,
+    running: bool,
 }
 
 impl VirtualMachine {
-
     pub fn new(code: Vec<Value>) -> Self {
         let stack = vec![0; DEFAULT_MEM_SIZE];
         let initial_sp = stack.len();
@@ -65,40 +62,79 @@ impl VirtualMachine {
         }
     }
 
-    pub fn run(&mut self) -> Result<(), VmError> {
-        self.running = true;
-
-        while self.running {
-            let instruction_value = self.fetch()?;
-            let instruction = Instruction::try_from(instruction_value)?;
-            self.execute(instruction)?;
-        }
-
-        Ok(())
-    }
-
-    // Internal method, keep private
-    fn fetch(&mut self) -> Result<Value, VmError> {
+    /// Fetches the next value from code memory (instruction or operand). Advances PC.
+    fn fetch_value(&mut self) -> Result<Value, VmError> {
         if self.pc >= self.code.len() {
             self.running = false;
             Err(VmError::PcOutOfBounds)
         } else {
-            let instruction_value = self.code[self.pc];
-
+            let value = self.code[self.pc];
             self.pc += 1;
-            Ok(instruction_value)
+            Ok(value)
         }
+    }
+
+    /// Fetches specifically an instruction.
+    fn fetch_instruction(&mut self) -> Result<Instruction, VmError> {
+        let value = self.fetch_value()?;
+        Instruction::try_from(value)
+    }
+
+    /// Fetches specifically an operand.
+    fn fetch_operand(&mut self) -> Result<Value, VmError> {
+        self.fetch_value().map_err(|e| match e {
+            VmError::PcOutOfBounds => VmError::OperandExpected, // More specific error
+            other => other,
+        })
+    }
+
+    /// Pushes a value onto the stack. Decrements SP.
+    pub(crate) fn push(&mut self, value: Value) -> Result<(), VmError> { // Changed to pub(crate) - tests won't call directly
+        if self.sp == 0 {
+            Err(VmError::StackOverflow)
+        } else {
+            self.sp -= 1; // Stack grows downwards
+            self.stack[self.sp] = value;
+            Ok(())
+        }
+    }
+
+    /// Pops a value from the stack. Increments SP.
+    #[allow(dead_code)] // Will be used by ADD, SUB etc. later
+    pub(crate) fn pop(&mut self) -> Result<Value, VmError> { // Changed to pub(crate)
+        if self.sp >= self.stack.len() {
+            Err(VmError::StackUnderflow)
+        } else {
+            let value = self.stack[self.sp];
+            self.sp += 1; // Stack grows downwards, so popping increases SP
+            Ok(value)
+        }
+    }
+
+    pub fn run(&mut self) -> Result<(), VmError> {
+        self.running = true;
+        while self.running {
+            let instruction = self.fetch_instruction()?; // Fetch first
+            self.execute(instruction)?; // Then execute
+            // Check running flag again in case EXIT occurred
+            if !self.running {
+                break;
+            }
+        }
+        Ok(())
     }
 
     fn execute(&mut self, instruction: Instruction) -> Result<(), VmError> {
         match instruction {
-            Instruction::Nop => {}
-            Instruction::Exit => {
-                self.running = false;
+            Instruction::Nop => { /* Do nothing */ }
+            Instruction::Imm => {
+                self.ax = self.fetch_operand()?; // Fetch operand *after* decoding IMM
             }
-            _ => {
-                self.running = false; // Stop the loop
-                return Err(VmError::InvalidInstruction(instruction as i32));
+            Instruction::Push => {
+                self.push(self.ax)?; // Push current value of AX
+            }
+            Instruction::Exit => {
+                self.running = false; // Signal run loop to stop
             }
         }
         Ok(())

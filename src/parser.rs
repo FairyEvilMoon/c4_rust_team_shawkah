@@ -577,7 +577,292 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
+    // Parse a block statement {...}
+    fn parse_block_statement(&mut self) -> Result<(), ParserError> {
+        self.expect(Token::LBrace)?;
+        // Note: Scoping for locals is handled by function entry/exit.
+        // C block scope for variables is not handled by C4 symbol table logic.
+        // All locals are function-scoped.
 
+        while !self.check(&Token::RBrace) {
+             // C4 doesn't parse declarations inside blocks, only at function top.
+             // So we only expect statements here.
+             if self.check(&Token::Int) || self.check(&Token::Char) || self.check(&Token::Enum){
+                  return Err(ParserError::SyntaxError("Variable declarations are only allowed at the top of a function in C4".to_string()));
+             } else {
+                self.parse_statement()?;
+             }
+        }
+        self.expect(Token::RBrace)?;
+        Ok(())
+    }
+
+    // Parse an expression statement (assignment or function called followed by ;)
+    fn parse_expression_statement(&mut self) -> Result<(), ParserError> {
+        self.parse_expression(Precedence::Assign)?;
+        self.expect(Token::Semicolon)?;
+        Ok(())
+    }
+
+    // Parse an expression using precedence climbing
+    fn parse_expression(&mut self, min_precedence: Precedence) -> Result<DataType, ParserError> {
+        // Parse the left-hand side (primary, unary, or nested expression)
+        let mut left_type = self.parse_unary_or_primary()?;
+
+        // Precedence climbing loop
+        loop {
+            let current_prec = token_precedence(&self.current_token);
+            if current_prec < min_precedence { // Using `<` because higher precedence binds tighter
+                break;
+            }
+
+            // Handle binary operators, postfix operators, conditional
+            let token = self.current_token.clone(); // Clone token for use after consume
+
+             match token {
+                 // --- Assignment ---
+                 Token::Assign => {
+                    // Ensure LHS is an lvalue (requires address)
+                    // Check the last emitted instruction sequence. LI/LC means we have value, not address.
+                    // LEA or IMM (for globals) means we have address.
+                    let last_op = self.code.last().map(|&op| Instruction::from(op));
+                     match last_op {
+                         Some(Instruction::LI) | Some(Instruction::LC) => {
+                             // Convert load to push address
+                             self.code.pop(); // Remove LI/LC
+                             self.emit(Instruction::PSH); // Push address left by LEA/IMM
+                         }
+                         _ => return Err(ParserError::TypeError("Lvalue required for assignment".to_string())),
+                     }
+
+                    self.consume()?; // Consume '='
+                    let right_type = self.parse_expression(Precedence::Assign)?; // Right associative for assign
+
+                    // Emit store instruction based on LHS type
+                    match left_type {
+                        DataType::Char => self.emit(Instruction::SC),
+                        DataType::Int | DataType::Ptr(_) => self.emit(Instruction::SI),
+                        DataType::Void => return Err(ParserError::TypeError("Cannot assign to void".to_string())),
+                    }
+                    // Assignment result is the assigned value (already in ax from right expr)
+                    // Type remains the type of the LHS
+                 }
+
+                 // --- Arithmetic / Bitwise / Logical ---
+                 Token::Add => { self.emit(Instruction::PSH); self.consume()?; let right = self.parse_expression(Precedence::Add)?; self.emit_binary_op(Instruction::ADD, left_type, right)?; left_type = DataType::Int; } // Pointer arith handled in emit
+                 Token::Sub => { self.emit(Instruction::PSH); self.consume()?; let right = self.parse_expression(Precedence::Add)?; self.emit_binary_op(Instruction::SUB, left_type, right)?; left_type = DataType::Int; } // Pointer arith handled in emit
+                 Token::Mul => { self.emit(Instruction::PSH); self.consume()?; self.parse_expression(Precedence::Mul)?; self.emit(Instruction::MUL); left_type = DataType::Int; }
+                 Token::Div => { self.emit(Instruction::PSH); self.consume()?; self.parse_expression(Precedence::Mul)?; self.emit(Instruction::DIV); left_type = DataType::Int; }
+                 Token::Mod => { self.emit(Instruction::PSH); self.consume()?; self.parse_expression(Precedence::Mul)?; self.emit(Instruction::MOD); left_type = DataType::Int; }
+                 Token::BitOr => { self.emit(Instruction::PSH); self.consume()?; self.parse_expression(Precedence::BitOr)?; self.emit(Instruction::OR); left_type = DataType::Int; }
+                 Token::BitXor=> { self.emit(Instruction::PSH); self.consume()?; self.parse_expression(Precedence::BitXor)?; self.emit(Instruction::XOR); left_type = DataType::Int; }
+                 Token::Ampersand | Token::BitAnd => { self.emit(Instruction::PSH); self.consume()?; self.parse_expression(Precedence::BitAnd)?; self.emit(Instruction::AND); left_type = DataType::Int; }
+                 Token::Eq => { self.emit(Instruction::PSH); self.consume()?; self.parse_expression(Precedence::Eq)?; self.emit(Instruction::EQ); left_type = DataType::Int; }
+                 Token::Ne => { self.emit(Instruction::PSH); self.consume()?; self.parse_expression(Precedence::Eq)?; self.emit(Instruction::NE); left_type = DataType::Int; }
+                 Token::Lt => { self.emit(Instruction::PSH); self.consume()?; self.parse_expression(Precedence::Lt)?; self.emit(Instruction::LT); left_type = DataType::Int; }
+                 Token::Gt => { self.emit(Instruction::PSH); self.consume()?; self.parse_expression(Precedence::Lt)?; self.emit(Instruction::GT); left_type = DataType::Int; }
+                 Token::Le => { self.emit(Instruction::PSH); self.consume()?; self.parse_expression(Precedence::Lt)?; self.emit(Instruction::LE); left_type = DataType::Int; }
+                 Token::Ge => { self.emit(Instruction::PSH); self.consume()?; self.parse_expression(Precedence::Lt)?; self.emit(Instruction::GE); left_type = DataType::Int; }
+                 Token::Shl => { self.emit(Instruction::PSH); self.consume()?; self.parse_expression(Precedence::Shl)?; self.emit(Instruction::SHL); left_type = DataType::Int; }
+                 Token::Shr => { self.emit(Instruction::PSH); self.consume()?; self.parse_expression(Precedence::Shl)?; self.emit(Instruction::SHR); left_type = DataType::Int; }
+
+                 // --- Logical (Short-circuiting) ---
+                 Token::LogOr => { // a || b --> if a is true (non-zero), result is 1, else eval b
+                     self.emit(Instruction::BNZ); // Branch if non-zero (true)
+                     let jump_if_true_addr = self.next_code_addr();
+                     self.emit_operand(Instruction::IMM, 0); // Placeholder
+                     self.consume()?;
+                     self.parse_expression(Precedence::LogAnd)?; // Evaluate right side only if needed
+                     let end_addr = self.next_code_addr();
+                     self.patch_jump(jump_if_true_addr - 1, end_addr)?;
+                     // If we got here, left was false, result is bool of right side (ax!=0)
+                     // C4 doesn't explicitly boolify, result is ax. Let's keep ax.
+                     left_type = DataType::Int;
+                 }
+                 Token::LogAnd => { // a && b --> if a is false (zero), result is 0, else eval b
+                     self.emit(Instruction::BZ); // Branch if zero (false)
+                     let jump_if_false_addr = self.next_code_addr();
+                     self.emit_operand(Instruction::IMM, 0); // Placeholder
+                     self.consume()?;
+                     self.parse_expression(Precedence::BitOr)?; // Evaluate right side only if needed
+                     let end_addr = self.next_code_addr();
+                     self.patch_jump(jump_if_false_addr - 1, end_addr)?;
+                     // If we got here, left was true, result is bool of right side (ax!=0)
+                     // C4 doesn't explicitly boolify, result is ax. Let's keep ax.
+                     left_type = DataType::Int;
+                 }
+
+                 // --- Postfix Operators ---
+                 Token::LBracket => { // Array indexing: ptr[index]
+                    let ptr_type = left_type;
+                     if ptr_type.pointer_level() == 0 {
+                        return Err(ParserError::TypeError("Attempting to index a non-pointer type".to_string()));
+                     }
+                    self.emit(Instruction::PSH); // Push pointer value
+                    self.consume()?; // Consume '['
+                    let index_type = self.parse_expression(Precedence::Assign)?; // Parse index expression
+                    self.expect(Token::RBracket)?; // Consume ']'
+
+                    // Emit pointer arithmetic: addr = base_ptr + index * sizeof(*base_ptr)
+                    let element_type = ptr_type.deref().unwrap(); // We checked it's a pointer
+                    if element_type.size_of() > 1 {
+                        self.emit_operand(Instruction::IMM, element_type.size_of());
+                        self.emit(Instruction::MUL); // index *= sizeof(element)
+                    }
+                    self.emit(Instruction::ADD); // base_ptr + scaled_index
+
+                    // Emit load instruction (result is an rvalue)
+                    match element_type {
+                        DataType::Char => self.emit(Instruction::LC),
+                        DataType::Int | DataType::Ptr(_) => self.emit(Instruction::LI),
+                        DataType::Void => return Err(ParserError::TypeError("Cannot index void pointer".to_string())),
+                    }
+                    left_type = element_type; // Type is the type of the element
+                 }
+                 Token::Inc | Token::Dec => { // Postfix ++ / --
+                     // Requires lvalue
+                     let last_op = self.code.last().map(|&op| Instruction::from(op));
+                      match last_op {
+                          Some(Instruction::LI) | Some(Instruction::LC) => {
+                             // 1. Save original address (it's below LI/LC)
+                             // Code: ..., LEA/IMM offset, LI/LC
+                             // We need to push the address again for the store.
+                             self.code.pop(); // Remove LI/LC
+                             // Stack has original value loaded by LI/LC
+                             // ax has original value
+                             // We need: PSH addr, PSH original_val
+                             // C4: if (*e == LC) { *e = PSH; *++e = LC; }
+                             self.emit(Instruction::PSH); // Push address
+                             match last_op {
+                                 Some(Instruction::LC) => self.emit(Instruction::LC),
+                                 _ => self.emit(Instruction::LI),
+                             }
+                             // Now stack: [..., address, original_value]
+                          }
+                          _ => return Err(ParserError::TypeError("Lvalue required for postfix ++/--".to_string())),
+                      }
+
+                      self.emit(Instruction::PSH); // Push address again (for store)
+                      self.emit_operand(Instruction::IMM, left_type.deref().unwrap_or(DataType::Char).size_of()); // Sizeof element
+                      if token == Token::Inc { self.emit(Instruction::ADD); } else { self.emit(Instruction::SUB); }
+
+                      // Store incremented/decremented value
+                      match left_type {
+                           DataType::Char => self.emit(Instruction::SC),
+                           DataType::Int | DataType::Ptr(_) => self.emit(Instruction::SI),
+                           _ => panic!("Should be lvalue"),
+                       }
+                       // Result of postfix is the *original* value. We need to subtract the increment back.
+                       self.emit(Instruction::PSH); // Push address (still on stack?) No, need to get it again? C4 pushes value.
+                       // C4 logic: Push value, Push IMM size, ADD/SUB, SC/SI, Push IMM size, SUB/ADD
+                       // Let's rethink. Stack after load: [..., address]. ax = value.
+                       // We need ax to hold original value at the end.
+                       // 1. PSH ax (original value)
+                       self.emit(Instruction::PSH);
+                       // 2. Calculate new value: ax = ax + size
+                       self.emit_operand(Instruction::IMM, left_type.deref().unwrap_or(DataType::Char).size_of());
+                       if token == Token::Inc { self.emit(Instruction::ADD); } else { self.emit(Instruction::SUB); }
+                       // 3. Store new value: PSH addr, ax=new_val, SI/SC
+                       // We need the address again. Assume it's below the original value pushed in step 1.
+                       // Need to swap stack[top] (original val) and stack[top-1] (address)? Complex.
+
+                       // Let's try C4's emit sequence more directly:
+                       // Assume code ends with LEA/IMM addr, LI/LC. ax=value.
+                       // C4: if (*e == LC) { *e = PSH; *++e = LC; } else { *e=PSH; *++e=LI; }
+                       // This pushes the address, then re-loads the value into ax.
+                       let last_op_val = self.code.pop().unwrap(); // LI or LC
+                       self.emit(Instruction::PSH); // Push address
+                       self.code.push(last_op_val); // Put LI/LC back
+                       // Stack: [..., address], ax = value
+
+                       // C4: *++e = PSH;
+                       self.emit(Instruction::PSH); // Push value ax
+                       // Stack: [..., address, value]
+
+                       // C4: *++e = IMM; *++e = size;
+                       self.emit_operand(Instruction::IMM, left_type.deref().unwrap_or(DataType::Char).size_of());
+                       // Stack: [..., address, value, size]
+
+                       // C4: *++e = (tk == Inc) ? ADD : SUB;
+                       let op = if token == Token::Inc { Instruction::ADD } else { Instruction::SUB };
+                       self.emit(op); // ax = value + size
+                       // Stack: [..., address]
+
+                       // C4: *++e = (ty == CHAR) ? SC : SI;
+                       let store_op = match left_type {
+                            DataType::Char => Instruction::SC,
+                            _ => Instruction::SI,
+                       };
+                       self.emit(store_op); // stack[address] = ax (new value). Pops address.
+                       // Stack: [...]
+
+                       // C4: *++e = PSH; *++e = IMM; *++e = size;
+                       self.emit(Instruction::PSH); // Push new value (still in ax) - NO, C4 pushes size!
+                       self.emit_operand(Instruction::IMM, left_type.deref().unwrap_or(DataType::Char).size_of());
+                       // Stack: [..., size]
+
+                       // C4: *++e = (tk == Inc) ? SUB : ADD;
+                       let op = if token == Token::Inc { Instruction::SUB } else { Instruction::ADD };
+                       self.emit(op); // ax = ax - size (restore original value)
+                       // Stack: [...]
+
+                       self.consume()?; // Consume ++ / --
+                       // Type doesn't change, value in ax is original value
+                 }
+
+                // --- Function Call ---
+                 Token::LParen => { // Function call
+                     let sym_entry = self.find_symbol_for_expression()?; // Get symbol for the function name expression
+                     if sym_entry.class != SymbolClass::Fun && sym_entry.class != SymbolClass::Sys {
+                        return Err(ParserError::TypeError(format!("'{}' is not a function", sym_entry.name)));
+                     }
+                     let func_type = sym_entry.data_type.clone(); // Should be function type if we had them
+                     let func_class = sym_entry.class;
+                     let func_val = sym_entry.value; // Address or syscall number
+
+                     self.consume()?; // Consume '('
+                     let mut arg_count = 0;
+                     while !self.check(&Token::RParen) {
+                         self.parse_expression(Precedence::Assign)?; // Parse argument expression
+                         self.emit(Instruction::PSH); // Push argument onto stack
+                         arg_count += 1;
+                         if !self.check(&Token::RParen) {
+                             self.expect(Token::Comma)?;
+                         }
+                     }
+                     self.expect(Token::RParen)?; // Consume ')'
+
+                     // Emit call instruction
+                     match func_class {
+                        SymbolClass::Sys => {
+                            // C4 emits the specific syscall opcode. func_val holds this opcode value.
+                            // Instruction::from converts the *integer value* back to the *enum variant*.
+                            self.emit(Instruction::from(func_val)); // Convert opcode value to enum
+                            ;
+                        }
+                        SymbolClass::Fun => {
+                            // func_val holds the entry address for JSR
+                            self.emit_operand(Instruction::JSR, func_val);
+                        }
+                        _ => unreachable!(),
+                    }
+
+                     // Adjust stack pointer to remove arguments
+                     if arg_count > 0 {
+                         self.emit_operand(Instruction::ADJ, arg_count);
+                     }
+
+                     // Result type is function's return type
+                     left_type = func_type;
+                 }
+
+                 _ => return Err(ParserError::InternalError(format!("Unhandled binary/postfix token: {:?}", token))),
+             } // end match token
+
+        } // end loop
+
+        Ok(left_type)
+    }
 
 
 

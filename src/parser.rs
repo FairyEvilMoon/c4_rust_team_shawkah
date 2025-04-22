@@ -864,6 +864,311 @@ impl<'a> Parser<'a> {
         Ok(left_type)
     }
 
+    // Parse primary expressions (literals, identifiers, and parenthesized expressions) and unary operations
+    fn parse_unary_or_primary(&mut self) -> Result<DataType, ParserError> {
+        let token = self.current_token.clone();
+
+        match token {
+            // --- Literals ---
+            Token::Number(val) => {
+                self.consume()?;
+                self.emit_operand(Instruction::IMM, val);
+                Ok(DataType::Int)
+            }
+             Token::CharLiteral(val) => {
+                 self.consume()?;
+                 self.emit_operand(Instruction::IMM, val as i64); // Promote char to int
+                 Ok(DataType::Char) // Type is char, though value is int
+             }
+             Token::StringLiteral(val) => {
+                 self.consume()?;
+                 // Store string in data segment, get address
+                  let addr = self.add_global_data(val.as_bytes());
+                  self.add_global_data(&[0]); // Null terminate
+                  self.emit_operand(Instruction::IMM, addr as i64); // Emit address as immediate
+                  Ok(DataType::pointer_to(DataType::Char)) // Type is char*
+             }
+
+            // --- Sizeof ---
+            Token::Sizeof => {
+                self.consume()?;
+                self.expect(Token::LParen)?;
+                // Parse type name inside sizeof
+                 let base_type = match self.current_token {
+                     Token::Int => { self.consume()?; DataType::Int },
+                     Token::Char => { self.consume()?; DataType::Char },
+                     _ => return Err(ParserError::UnexpectedToken(self.current_token.clone(), "type name (int/char)".to_string())),
+                 };
+                 let mut target_type = base_type;
+                 while self.check(&Token::Asterisk) {
+                     self.consume()?;
+                     target_type = DataType::pointer_to(target_type);
+                 }
+                self.expect(Token::RParen)?;
+
+                self.emit_operand(Instruction::IMM, target_type.size_of());
+                Ok(DataType::Int) // Result of sizeof is int
+            }
+
+            // --- Parenthesized Expression ---
+            Token::LParen => {
+                self.consume()?;
+                 // Check for type cast: (type) expr
+                 let is_cast = match self.current_token {
+                     Token::Int | Token::Char => true,
+                     _ => false,
+                 };
+
+                 if is_cast {
+                     let base_type = if self.check(&Token::Int) { self.consume()?; DataType::Int } else { self.consume()?; DataType::Char };
+                     let mut cast_target_type = base_type;
+                      while self.check(&Token::Asterisk) {
+                          self.consume()?;
+                          cast_target_type = DataType::pointer_to(cast_target_type);
+                      }
+                      self.expect(Token::RParen)?;
+                      // Parse the expression being casted
+                      let _original_type = self.parse_expression(Precedence::Unary)?; // Cast has high precedence
+                      Ok(cast_target_type)
+
+                 } else {
+                      // Regular parenthesized expression
+                     let expr_type = self.parse_expression(Precedence::Assign)?; // Start precedence low inside parens
+                     self.expect(Token::RParen)?;
+                     Ok(expr_type) // Type is the type of the inner expression
+                 }
+            }
+
+            // --- Identifiers (Variables, Enum constants, Functions) ---
+            Token::Ident(name) => {
+                self.consume()?;
+                match self.symbols.find(&name) {
+                    Some(entry) => {
+                        let sym_type = entry.data_type.clone();
+                        match entry.class {
+                            SymbolClass::Num => { // Enum constant
+                                self.emit_operand(Instruction::IMM, entry.value);
+                                Ok(DataType::Int)
+                            }
+                            SymbolClass::Loc => { // Local variable
+                                // Emit LEA (Load Effective Address) using offset from BP
+                                self.emit_operand(Instruction::LEA, entry.value); // Value is offset
+                                // Emit load instruction (LI/LC) to get the value
+                                match sym_type {
+                                    DataType::Char => self.emit(Instruction::LC),
+                                    DataType::Int | DataType::Ptr(_) => self.emit(Instruction::LI),
+                                    DataType::Void => return Err(ParserError::TypeError("Cannot use void variable".to_string())),
+                                }
+                                Ok(sym_type)
+                            }
+                            SymbolClass::Glo => { // Global variable
+                                 // Emit IMM (Immediate) with the address in the data segment
+                                self.emit_operand(Instruction::IMM, entry.value); // Value is data address
+                                // Emit load instruction (LI/LC) to get the value
+                                match sym_type {
+                                    DataType::Char => self.emit(Instruction::LC),
+                                    DataType::Int | DataType::Ptr(_) => self.emit(Instruction::LI),
+                                    DataType::Void => return Err(ParserError::TypeError("Cannot use void variable".to_string())),
+                                }
+                                Ok(sym_type)
+                            }
+                            SymbolClass::Fun | SymbolClass::Sys => {
+                                // Function name used as value (address) - Not typical in C4 exprs unless taking addr-of
+                                // For now, treat this as an error if not followed by '(' (handled in parse_expression loop)
+                                // If & operator is used, parse_unary handles it.
+                                Err(ParserError::SyntaxError(format!("Unexpected use of function name '{}' as a value", name)))
+                            }
+                             SymbolClass::Enum => Err(ParserError::SyntaxError(format!("Cannot use enum tag '{}' as a value", name))),
+                        }
+                    }
+                    None => Err(ParserError::UndefinedSymbol(name)),
+                }
+            }
+
+            // --- Unary Operators ---
+             Token::Asterisk => { // Dereference '*'
+                 self.consume()?;
+                 let ptr_type = self.parse_expression(Precedence::Unary)?; // Parse operand
+                 match ptr_type.deref() {
+                    Some(target_type) => {
+                        // Emit load instruction LI/LC based on target type
+                        match target_type {
+                            DataType::Char => self.emit(Instruction::LC),
+                            DataType::Int | DataType::Ptr(_) => self.emit(Instruction::LI),
+                            DataType::Void => return Err(ParserError::TypeError("Cannot dereference void pointer".to_string())),
+                        }
+                        Ok(target_type) // Result type is the pointed-to type
+                    }
+                    None => Err(ParserError::TypeError("Cannot dereference non-pointer type".to_string())),
+                 }
+             }
+            Token::Ampersand => { // Address-of '&'
+                self.consume()?;
+                 // The operand must be an lvalue (variable).
+                 // We need to parse the operand *without* the final LI/LC.
+                 // Let's parse it normally and then remove the load instruction.
+                 let lvalue_type = self.parse_expression(Precedence::Unary)?;
+                 let last_op = self.code.last().map(|&op| Instruction::from(op));
+                  match last_op {
+                      Some(Instruction::LI) | Some(Instruction::LC) => {
+                          self.code.pop(); // Remove the load, leave the address in ax
+                          Ok(DataType::pointer_to(lvalue_type)) // Result type is pointer to operand type
+                      }
+                      _ => Err(ParserError::TypeError("Cannot take address of non-lvalue".to_string())),
+                  }
+            }
+            Token::Not => { // Logical NOT '!'
+                self.consume()?;
+                self.parse_expression(Precedence::Unary)?;
+                // C4: PSH, IMM 0, EQ -> Check if ax == 0
+                self.emit(Instruction::PSH); // Push ax
+                self.emit_operand(Instruction::IMM, 0);
+                self.emit(Instruction::EQ); // ax = (ax == 0)
+                Ok(DataType::Int)
+            }
+            Token::Sub => { // Unary minus '-'
+                self.consume()?;
+                 // Check if next is number literal for optimization
+                 if let Token::Number(val) = self.current_token {
+                     self.consume()?;
+                     self.emit_operand(Instruction::IMM, -val);
+                 } else {
+                     self.parse_expression(Precedence::Unary)?;
+                     // C4: IMM -1, PSH, MUL --> Multiply by -1
+                      // Let's optimize: PSH 0, SUB -> 0 - ax
+                      self.emit(Instruction::PSH);
+                      self.emit_operand(Instruction::IMM, 0);
+                      self.emit(Instruction::SUB); // ax = 0 - ax
+                 }
+                Ok(DataType::Int)
+            }
+            Token::Add => { // Unary plus '+' (No-op)
+                 self.consume()?;
+                 self.parse_expression(Precedence::Unary)?;
+                 Ok(DataType::Int) // Type doesn't change, no code emitted
+            }
+             Token::Inc | Token::Dec => { // Prefix ++ / --
+                 let op_token = token;
+                 self.consume()?;
+                 // Operand must be lvalue
+                 let target_type = self.parse_expression(Precedence::Unary)?;
+                 // Check last instruction was load, remove it
+                 let last_op = self.code.last().map(|&op| Instruction::from(op));
+                  let addr_in_ax = match last_op {
+                      Some(Instruction::LI) | Some(Instruction::LC) => {
+                          self.code.pop(); // Remove load, address is in ax
+                          true
+                      }
+                      _ => return Err(ParserError::TypeError("Lvalue required for prefix ++/--".to_string())),
+                  };
+
+                 // 1. Push address (currently in ax)
+                 self.emit(Instruction::PSH);
+                 // 2. Reload value: LI/LC
+                  match target_type {
+                      DataType::Char => self.emit(Instruction::LC),
+                      DataType::Int | DataType::Ptr(_) => self.emit(Instruction::LI),
+                      _ => panic!("Should be lvalue type"),
+                  }
+                 // 3. Increment/decrement ax
+                 self.emit(Instruction::PSH); // Push value
+                 self.emit_operand(Instruction::IMM, target_type.deref().unwrap_or(DataType::Char).size_of());
+                 let op = if op_token == Token::Inc { Instruction::ADD } else { Instruction::SUB };
+                 self.emit(op); // ax = value +/- size
+                 // 4. Store back: SC/SI
+                  let store_op = match target_type {
+                      DataType::Char => Instruction::SC,
+                      _ => Instruction::SI,
+                  };
+                 self.emit(store_op); // Pops address, stores ax
+
+                 // Result is the *new* value (already in ax)
+                 Ok(target_type)
+             }
+            _ => Err(ParserError::UnexpectedToken(token, "expression".to_string())),
+        }
+    }
+
+    // Helper to find symbol associated with the start of the current expression part.
+    // Used for function calls where the name might be complex (e.g., `ptr->func()`).
+    // Simplified: Assumes the function name is a direct identifier for now.
+    fn find_symbol_for_expression(&self) -> Result<SymbolEntry, ParserError> {
+    // Handle `Id (` specially at start of `parse_unary_or_primary` ---
+    // This seems the most direct translation of C4's logic.
+    if let Token::Ident(name) = &self.current_token {
+            if let Some(entry) = self.symbols.find(name) {
+                if entry.class == SymbolClass::Fun || entry.class == SymbolClass::Sys {
+                    // Peek ahead to see if it's a function call
+                    if self.peek()? == &Token::LParen {
+                        // Return a dummy type, the call logic in parse_expression will handle it
+                        // We need to pass the symbol info though...
+                        // Maybe return Result< (DataType, Option<SymbolEntry>) > ?
+                        // Let's just return the symbol entry directly for now.
+                        return Ok(entry.clone()); // Clone needed as find returns ref
+                    }
+                }
+            }
+    }
+        // C4's `d=id; next(); if (tk == '(')` is simpler. Let's refactor `parse_expression` start.
+
+        Err(ParserError::InternalError("Cannot reliably find function symbol in current structure".to_string()))
+}
+
+ // --- Helper for Binary Ops (Pointer Arithmetic) ---
+ fn emit_binary_op(&mut self, op: Instruction, left: DataType, right: DataType) -> Result<(), ParserError> {
+    match op {
+        Instruction::ADD => {
+            // ptr + int | int + ptr
+            if left.pointer_level() > 0 && right == DataType::Int {
+                // left is ptr, right is int. Scale right by sizeof(*left)
+                self.emit_operand(Instruction::IMM, left.deref().unwrap().size_of());
+                self.emit(Instruction::MUL); // ax = right * scale
+            } else if left == DataType::Int && right.pointer_level() > 0 {
+                // left is int, right is ptr. Swap operands before scaling.
+                // Need VM instruction SWAP or simulate with stack ops (PSH, LI from stack, PSH other, LI) - complex.
+                // Let's assume VM handles ptr+int symmetrically for now, or require ptr on left.
+                 return Err(ParserError::NotImplemented("int + ptr needs operand swap or VM support".to_string()));
+                // Alternative: emit PSH left_val, load right_ptr, PSH right_ptr, load left_val (from stack)
+                // then scale left_val, then ADD.
+            } else if left.pointer_level() > 0 && right.pointer_level() > 0 {
+                return Err(ParserError::TypeError("Cannot add two pointers".to_string()));
+            }
+            // If both ints, or other cases, just add.
+            self.emit(Instruction::ADD);
+        }
+        Instruction::SUB => {
+            // ptr - int
+            if left.pointer_level() > 0 && right == DataType::Int {
+                // left is ptr, right is int. Scale right by sizeof(*left)
+                self.emit_operand(Instruction::IMM, left.deref().unwrap().size_of());
+                self.emit(Instruction::MUL); // ax = right * scale
+                self.emit(Instruction::SUB); // result = left_ptr - scaled_right
+            }
+            // ptr - ptr
+            else if left.pointer_level() > 0 && right.pointer_level() > 0 {
+                 if left != right { // Ensure pointers are compatible (same base type) - simple check
+                     return Err(ParserError::TypeError("Subtracting incompatible pointer types".to_string()));
+                 }
+                 self.emit(Instruction::SUB); // result = ptr1_addr - ptr2_addr (byte difference)
+                 // Divide by element size to get element difference
+                 self.emit(Instruction::PSH); // Push byte difference
+                 self.emit_operand(Instruction::IMM, left.deref().unwrap().size_of());
+                 self.emit(Instruction::DIV); // result = byte_diff / sizeof(element)
+            }
+            // int - ptr (invalid)
+            else if left == DataType::Int && right.pointer_level() > 0 {
+                 return Err(ParserError::TypeError("Cannot subtract pointer from integer".to_string()));
+            }
+            // int - int
+            else {
+                self.emit(Instruction::SUB);
+            }
+        }
+         // Default for other ops (no pointer specific logic needed for *, /, %, etc.)
+        _ => self.emit(op),
+    }
+     Ok(())
+}
 
 
 }

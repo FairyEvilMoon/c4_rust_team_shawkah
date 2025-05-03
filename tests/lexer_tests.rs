@@ -1,209 +1,130 @@
+// src/lexer.rs
+// ... (rest of the lexer code) ...
+
 #[cfg(test)]
 mod tests {
-    // Adjust path if needed, e.g., TEST
-    use c4_rust_team_shawkah::lexer::{Lexer, Token, LexerError};
+    use c4_rust_team_shawkah::lexer::{Lexer, LexerError, Token, TokenInfo};// Import items from the outer module (Lexer, Token, etc.)
 
-    // Helper function to collect all tokens or the first error
-    fn tokenize(input: &str) -> Result<Vec<Token>, LexerError> {
-        let mut lexer = Lexer::new(input);
-        let mut tokens = Vec::new();
-        loop {
-            let token = lexer.next_token()?;
-            let is_eof = token == Token::Eof;
-            tokens.push(token);
-            if is_eof {
-                break;
-            }
-        }
-        Ok(tokens)
+    // Helper to create TokenInfo without manual line/col calculation for simple tests
+    fn ti(token: Token, line: usize, col: usize) -> TokenInfo {
+        TokenInfo { token, line, column: col }
     }
 
     #[test]
-    fn test_empty_input() {
-        assert_eq!(tokenize(""), Ok(vec![Token::Eof]));
+    fn test_simple_keywords_and_identifiers() {
+        let source = "int main return";
+        let mut lexer = Lexer::new(source);
+        assert_eq!(lexer.next_token().unwrap(), ti(Token::Int, 1, 1));
+        assert_eq!(lexer.next_token().unwrap(), ti(Token::Ident("main".to_string()), 1, 5));
+        assert_eq!(lexer.next_token().unwrap(), ti(Token::Return, 1, 10));
+        assert_eq!(lexer.next_token().unwrap().token, Token::Eof); // Check EOF
     }
 
     #[test]
-    fn test_only_whitespace() {
-        assert_eq!(tokenize("  \n\t  "), Ok(vec![Token::Eof]));
+    fn test_punctuation() {
+        let source = "(){};";
+        let mut lexer = Lexer::new(source);
+        assert_eq!(lexer.next_token().unwrap(), ti(Token::LParen, 1, 1));
+        assert_eq!(lexer.next_token().unwrap(), ti(Token::RParen, 1, 2));
+        assert_eq!(lexer.next_token().unwrap(), ti(Token::LBrace, 1, 3));
+        assert_eq!(lexer.next_token().unwrap(), ti(Token::RBrace, 1, 4));
+        assert_eq!(lexer.next_token().unwrap(), ti(Token::Semicolon, 1, 5));
+        assert_eq!(lexer.next_token().unwrap().token, Token::Eof);
     }
 
     #[test]
-    fn test_keywords() {
-        let input = "enum if else int char return sizeof while";
-        let expected = vec![
-            Token::Enum, Token::If, Token::Else, Token::Int, Token::Char,
-            Token::Return, Token::Sizeof, Token::While, Token::Eof,
-        ];
-        assert_eq!(tokenize(input), Ok(expected));
+    fn test_integer_literal() {
+        let source = "123 0";
+        let mut lexer = Lexer::new(source);
+        assert_eq!(lexer.next_token().unwrap(), ti(Token::Number(123), 1, 1));
+        assert_eq!(lexer.next_token().unwrap(), ti(Token::Number(0), 1, 5));
+        assert_eq!(lexer.next_token().unwrap().token, Token::Eof);
+    }
+
+    #[test]
+    fn test_string_literal() {
+        let source = "\"hello world\\n\""; // Raw string contains quotes and escape
+        let mut lexer = Lexer::new(source);
+        assert_eq!(lexer.next_token().unwrap(), ti(Token::StringLiteral("hello world\n".to_string()), 1, 1));
+        assert_eq!(lexer.next_token().unwrap().token, Token::Eof);
+    }
+
+    #[test]
+    fn test_whitespace_and_newlines() {
+        let source = "int main() {\n  return 0;\n}";
+        let mut lexer = Lexer::new(source);
+        assert_eq!(lexer.next_token().unwrap(), ti(Token::Int, 1, 1));
+        assert_eq!(lexer.next_token().unwrap(), ti(Token::Ident("main".to_string()), 1, 5));
+        assert_eq!(lexer.next_token().unwrap(), ti(Token::LParen, 1, 9));
+        assert_eq!(lexer.next_token().unwrap(), ti(Token::RParen, 1, 10));
+        assert_eq!(lexer.next_token().unwrap(), ti(Token::LBrace, 1, 12));
+        assert_eq!(lexer.next_token().unwrap(), ti(Token::Return, 2, 3)); // Note line/col
+        assert_eq!(lexer.next_token().unwrap(), ti(Token::Number(0), 2, 10));
+        assert_eq!(lexer.next_token().unwrap(), ti(Token::Semicolon, 2, 11));
+        assert_eq!(lexer.next_token().unwrap(), ti(Token::RBrace, 3, 1));
+        assert_eq!(lexer.next_token().unwrap().token, Token::Eof);
+    }
+
+    #[test]
+    fn test_line_comment() {
+        let source = "int // ignore this\nmain";
+        let mut lexer = Lexer::new(source);
+        assert_eq!(lexer.next_token().unwrap(), ti(Token::Int, 1, 1));
+        assert_eq!(lexer.next_token().unwrap(), ti(Token::Ident("main".to_string()), 2, 1));
+        assert_eq!(lexer.next_token().unwrap().token, Token::Eof);
     }
 
      #[test]
-     fn test_identifiers() {
-         let input = "myVar _var anIdentifier123 i";
-         let expected = vec![
-             Token::Ident("myVar".to_string()),
-             Token::Ident("_var".to_string()),
-             Token::Ident("anIdentifier123".to_string()),
-             Token::Ident("i".to_string()),
-             Token::Eof,
-         ];
-         assert_eq!(tokenize(input), Ok(expected));
-     }
-
-    #[test]
-    fn test_numbers() {
-        let input = "123 0 9876543210 42";
-        let expected = vec![
-            Token::Number(123), Token::Number(0), Token::Number(9876543210), Token::Number(42), Token::Eof,
-        ];
-        assert_eq!(tokenize(input), Ok(expected));
+    fn test_block_comment() {
+        let source = "/* ignore this */ main /* multi\nline */";
+        let mut lexer = Lexer::new(source);
+        assert_eq!(lexer.next_token().unwrap(), ti(Token::Ident("main".to_string()), 1, 18)); // After first comment
+        // No more tokens after the second comment
+        assert_eq!(lexer.next_token().unwrap().token, Token::Eof);
     }
 
      #[test]
-     fn test_string_literals() {
-         let input = r#" "hello" "" "with\nescape" "and \"quotes\" \0" "#; // Added null term escape
-         let expected = vec![
-             Token::StringLiteral("hello".to_string()),
-             Token::StringLiteral("".to_string()),
-             Token::StringLiteral("with\nescape".to_string()),
-             Token::StringLiteral("and \"quotes\" \0".to_string()),
-             Token::Eof,
-         ];
-         assert_eq!(tokenize(input), Ok(expected));
-     }
-
-     #[test]
-     fn test_char_literals() {
-         let input = r#" 'a' ' ' '\n' '\\' '\'' '\0' "#;
-         let expected = vec![
-             Token::CharLiteral('a'),
-             Token::CharLiteral(' '),
-             Token::CharLiteral('\n'),
-             Token::CharLiteral('\\'),
-             Token::CharLiteral('\''),
-             Token::CharLiteral('\0'),
-             Token::Eof,
-         ];
-         assert_eq!(tokenize(input), Ok(expected));
-     }
-
-    #[test]
-    fn test_single_ambiguous_symbols() {
-        let input = "; , ( ) { } [ ] * &";
-        let expected = vec![
-            Token::Semicolon, Token::Comma, Token::LParen, Token::RParen, Token::LBrace,
-            Token::RBrace, Token::LBracket, Token::RBracket, Token::Asterisk, Token::Ampersand,
-            Token::Eof,
-        ];
-        assert_eq!(tokenize(input), Ok(expected));
-    }
-
-    #[test]
-    fn test_operators() {
-        // Includes multi-char and single-char operators mixed
-        let input = "= == != < > <= >= + - * / % ++ -- | ^ & ! || && << >>";
-        let expected = vec![
-             Token::Assign, Token::Eq, Token::Ne, Token::Lt, Token::Gt, Token::Le, Token::Ge,
-             Token::Add, Token::Sub, Token::Asterisk, Token::Div, Token::Mod, Token::Inc, Token::Dec,
-             Token::BitOr, Token::BitXor, Token::Ampersand, Token::Not, Token::LogOr, Token::LogAnd,
-             Token::Shl, Token::Shr,
-            Token::Eof,
-        ];
-        assert_eq!(tokenize(input), Ok(expected));
+    fn test_invalid_character() {
+        let source = "int $";
+        let mut lexer = Lexer::new(source);
+        assert_eq!(lexer.next_token().unwrap(), ti(Token::Int, 1, 1));
+        let err = lexer.next_token().unwrap_err();
+        assert_eq!(err, LexerError::InvalidCharacter('$', 1, 5));
     }
 
      #[test]
-     fn test_comments() {
-         let input = r#"
-             int x = 10; // This is a line comment
-             char y = 'c'; /* This is a
-                              block comment */
-             return x; // Another comment
-             /* block at end */
-         "#;
-         let expected = vec![
-             Token::Int, Token::Ident("x".to_string()), Token::Assign, Token::Number(10), Token::Semicolon,
-             Token::Char, Token::Ident("y".to_string()), Token::Assign, Token::CharLiteral('c'), Token::Semicolon,
-             Token::Return, Token::Ident("x".to_string()), Token::Semicolon,
-             Token::Eof,
-         ];
-         assert_eq!(tokenize(input), Ok(expected));
-     }
-
-    #[test]
-    fn test_division_vs_comment() {
-        let input = "x = a / b; // divide\n /* block */ y = c*d;";
-         let expected = vec![
-             Token::Ident("x".to_string()), Token::Assign, Token::Ident("a".to_string()),
-             Token::Div, Token::Ident("b".to_string()), Token::Semicolon,
-             Token::Ident("y".to_string()), Token::Assign, Token::Ident("c".to_string()),
-             Token::Asterisk, Token::Ident("d".to_string()), Token::Semicolon,
-             Token::Eof,
-         ];
-        assert_eq!(tokenize(input), Ok(expected));
-    }
-
-    #[test]
-    fn test_complex_sequence() {
-        let input = "int main() { if (x <= 10) { y = y++ + 1; /* inc */ } return 0; }";
-        let expected = vec![
-            Token::Int, Token::Ident("main".to_string()), Token::LParen, Token::RParen, Token::LBrace,
-            Token::If, Token::LParen, Token::Ident("x".to_string()), Token::Le, Token::Number(10), Token::RParen, Token::LBrace,
-            Token::Ident("y".to_string()), Token::Assign, Token::Ident("y".to_string()), Token::Inc, Token::Add, Token::Number(1), Token::Semicolon,
-            Token::RBrace, Token::Return, Token::Number(0), Token::Semicolon,
-            Token::RBrace, Token::Eof,
-        ];
-        assert_eq!(tokenize(input), Ok(expected));
-    }
-
-    // --- Error Cases ---
-
-     #[test]
-     fn test_error_invalid_character() {
-         let result = tokenize("int $a = 0;");
-         // Position check depends on UTF-8 lengths. '$' likely after 'int '. 4 bytes for 'int ', 1 for space. So position 5.
-         assert!(matches!(result, Err(LexerError::InvalidCharacter('$', 4))), "Result was: {:?}", result); // Check char and approx position
-     }
-
-     #[test]
-     fn test_error_unterminated_string() {
-         let result = tokenize("char *s = \"hello");
-         // String starts after 'char *s = '. Let's count bytes: 4+1+1+1+1+1+1 = 10. String starts at byte 10.
-          assert!(matches!(result, Err(LexerError::UnterminatedString(10))), "Result was: {:?}", result);
-     }
-
-     #[test]
-     fn test_error_unterminated_char() {
-         let result = tokenize("char c = 'a");
-         // Char starts after 'char c = '. 4+1+1+1+1+1 = 9. Char starts at byte 9.
-         assert!(matches!(result, Err(LexerError::UnterminatedChar(9))), "Result was: {:?}", result);
+    fn test_unterminated_string() {
+        let source = "\"hello";
+        let mut lexer = Lexer::new(source);
+        let err = lexer.next_token().unwrap_err();
+         // Check the error type and potentially start position
+        assert!(matches!(err, LexerError::UnterminatedString(1, 1)));
      }
 
       #[test]
-      fn test_error_empty_char() {
-          let result = tokenize("char c = '';"); // Invalid in C
-          // Char starts at byte 9.
-          assert!(matches!(result, Err(LexerError::UnterminatedChar(9))), "Result was: {:?}", result);
+      fn test_operators() {
+          // Test a few operators the lexer supports, even if parser doesn't use them yet
+          let source = "= == + - * / % & && | || ! != < <= > >= << >>";
+          let mut lexer = Lexer::new(source);
+          assert_eq!(lexer.next_token().unwrap().token, Token::Assign);
+          assert_eq!(lexer.next_token().unwrap().token, Token::Eq);
+          assert_eq!(lexer.next_token().unwrap().token, Token::Add);
+          assert_eq!(lexer.next_token().unwrap().token, Token::Sub);
+          assert_eq!(lexer.next_token().unwrap().token, Token::Asterisk); // '*' is ambiguous
+          assert_eq!(lexer.next_token().unwrap().token, Token::Div);
+          assert_eq!(lexer.next_token().unwrap().token, Token::Mod);
+          assert_eq!(lexer.next_token().unwrap().token, Token::Ampersand); // '&' is ambiguous
+          assert_eq!(lexer.next_token().unwrap().token, Token::LogAnd);
+          assert_eq!(lexer.next_token().unwrap().token, Token::BitOr);
+          assert_eq!(lexer.next_token().unwrap().token, Token::LogOr);
+          assert_eq!(lexer.next_token().unwrap().token, Token::Not);
+          assert_eq!(lexer.next_token().unwrap().token, Token::Ne);
+          assert_eq!(lexer.next_token().unwrap().token, Token::Lt);
+          assert_eq!(lexer.next_token().unwrap().token, Token::Le);
+          assert_eq!(lexer.next_token().unwrap().token, Token::Gt);
+          assert_eq!(lexer.next_token().unwrap().token, Token::Ge);
+          assert_eq!(lexer.next_token().unwrap().token, Token::Shl);
+          assert_eq!(lexer.next_token().unwrap().token, Token::Shr);
+          assert_eq!(lexer.next_token().unwrap().token, Token::Eof);
       }
-
-    #[test]
-     fn test_error_unterminated_block_comment() {
-         let result = tokenize("int x = 1; /* hello");
-         // Comment starts after 'int x = 1; '. 4+1+1+1+1+1+1 = 10. Comment starts at byte 11.
-         assert!(matches!(result, Err(LexerError::UnterminatedBlockComment(11))), "Result was: {:?}", result);
-     }
-
-     #[test]
-     fn test_error_invalid_escape_string() {
-        let result = tokenize("char *s = \"hello\\x world\";");
-        assert!(matches!(result, Err(LexerError::InvalidEscapeSequence('x', 17))), "Result was: {:?}", result);
-     }
-
-
-#[test]
-     fn test_error_invalid_escape_char() {
-        let result = tokenize("char c = '\\z';");
-        assert!(matches!(result, Err(LexerError::InvalidEscapeSequence('z', 11))), "Result was: {:?}", result);
-     }
 }

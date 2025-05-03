@@ -34,7 +34,6 @@ pub enum Instruction {
 }
 
 // --- Instruction TryFrom<Value> ---
-// (Identical to your provided code - assuming it's correct)
 impl TryFrom<Value> for Instruction {
     type Error = VmError;
     fn try_from(value: Value) -> Result<Self, Self::Error> {
@@ -98,19 +97,19 @@ impl std::error::Error for VmError {}
 pub struct VirtualMachine {
     // Registers
     pc: usize,
-    pub sp: usize, // <-- Make pub
+    pub sp: usize, // Make pub for potential external inspection/debugging
     bp: usize,
     ax: Value,
 
     // Memory
     code: Vec<Value>,
-    memory: Vec<Value>,
+    memory: Vec<Value>, // Combined Stack/Heap area
     data_segment: Vec<u8>,
 
     // State
     running: bool,
     code_size: usize,
-    pub memory_size: usize, // <-- Make pub
+    pub memory_size: usize, // Make pub for potential external inspection/debugging
 }
 
 
@@ -122,19 +121,19 @@ impl VirtualMachine {
 
     /// Creates a new VM with specific memory size.
     pub fn with_memory_size(code: Vec<Value>, data_segment: Vec<u8>, memory_bytes: usize) -> Self {
-        // Memory size needs to be in words (Value size)
+        // Ensure memory size is appropriate for Value type
         let memory_word_size = memory_bytes / std::mem::size_of::<Value>();
         if memory_word_size == 0 {
             panic!("Memory size must be at least {} bytes", std::mem::size_of::<Value>());
         }
         let memory = vec![0; memory_word_size]; // Initialize memory with zeros
         let code_size = code.len();
-        let initial_sp = memory_word_size; // SP starts just *past* the end
+        let initial_sp = memory_word_size; // SP starts just *past* the end (stack grows down)
 
         VirtualMachine {
             pc: 0,
             sp: initial_sp,
-            bp: initial_sp,
+            bp: initial_sp, // BP initially same as SP
             ax: 0,
             code,
             memory,
@@ -149,7 +148,7 @@ impl VirtualMachine {
     #[inline]
     fn fetch_value(&mut self) -> Result<Value, VmError> {
         if self.pc >= self.code_size {
-            self.running = false;
+            self.running = false; // Stop if PC goes out of bounds
             Err(VmError::PcOutOfBounds)
         } else {
             let value = self.code[self.pc];
@@ -166,23 +165,20 @@ impl VirtualMachine {
 
     #[inline]
     fn fetch_operand(&mut self) -> Result<Value, VmError> {
+        // Fetch value, but return OperandExpected if PC was already out of bounds
         self.fetch_value().map_err(|e| match e {
             VmError::PcOutOfBounds => VmError::OperandExpected,
             other => other,
         })
     }
 
-    // --- Stack Operations (using `memory`) ---
-    // SP points *at* the top used slot or memory_size if empty.
-    // Push: Decrement SP, write value.
-    // Pop: Read value, increment SP.
+    // --- Stack Operations ---
     #[inline]
     fn push(&mut self, value: Value) -> Result<(), VmError> {
         if self.sp == 0 { // Stack grows down, overflow if SP hits 0
             Err(VmError::StackOverflow)
         } else {
-            self.sp -= 1;
-            // Safety: Bounds check is implicit in sp == 0 check above and sp <= memory_size
+            self.sp -= 1; // Decrement SP *before* writing
             self.memory[self.sp] = value;
             Ok(())
         }
@@ -193,51 +189,43 @@ impl VirtualMachine {
         if self.sp >= self.memory_size { // Underflow if SP is at or beyond the initial top
             Err(VmError::StackUnderflow)
         } else {
-            // Safety: Bounds check is implicit in sp >= memory_size check above
             let value = self.memory[self.sp];
-            self.sp += 1;
+            self.sp += 1; // Increment SP *after* reading
             Ok(value)
         }
     }
 
     // --- Memory Validation ---
-    // Validates addresses used for word access (Li, Si) in the main `memory`
     #[inline]
     fn validate_memory_word_address(&self, addr_val: Value) -> Result<usize, VmError> {
         if addr_val < 0 {
             return Err(VmError::MemoryAccessOutOfBounds { address: addr_val, memory_type: "Stack/Heap".to_string()});
         }
         let addr_usize = addr_val as usize;
-        if addr_usize >= self.memory_size {
+        if addr_usize >= self.memory_size { // Check against stack/heap size
             return Err(VmError::MemoryAccessOutOfBounds { address: addr_val, memory_type: "Stack/Heap".to_string()});
         }
         Ok(addr_usize)
     }
 
-     // Validates addresses used for byte access (Lc, Sc) in the main `memory`
-     // This needs careful handling as memory stores Values (i32)
      #[inline]
      fn validate_memory_byte_address(&self, addr_val: Value) -> Result<usize, VmError> {
-         // For simplicity, C4 often treats char* as int* / word addresses.
-         // A true byte-addressable VM is more complex.
-         // Let's assume Lc/Sc operate on the low byte of the word at the given *word* address.
+         // For Lc/Sc, we still operate on word addresses but handle bytes within that word.
          self.validate_memory_word_address(addr_val)
      }
 
-    // Validates addresses for reading bytes from the data segment
     #[inline]
     fn validate_data_segment_address(&self, addr_val: Value) -> Result<usize, VmError> {
         if addr_val < 0 {
              return Err(VmError::MemoryAccessOutOfBounds { address: addr_val, memory_type: "Data Segment".to_string()});
         }
         let addr_usize = addr_val as usize;
-        // Important: Check against data_segment length
+        // Check against data_segment length
         if addr_usize >= self.data_segment.len() {
              return Err(VmError::MemoryAccessOutOfBounds { address: addr_val, memory_type: "Data Segment".to_string()});
         }
         Ok(addr_usize)
     }
-
 
     #[inline]
     fn validate_jump_target(&self, target_val: Value) -> Result<usize, VmError> {
@@ -245,6 +233,7 @@ impl VirtualMachine {
              return Err(VmError::InvalidJumpTarget(target_val));
          }
          let target_pc = target_val as usize;
+         // Jumps must be within the code segment bounds
          if target_pc >= self.code_size {
              return Err(VmError::InvalidJumpTarget(target_val));
          }
@@ -252,15 +241,14 @@ impl VirtualMachine {
     }
 
     // --- Arithmetic Helpers ---
-    // (Identical to your provided code - assuming checked operations are desired)
     #[inline] fn checked_add(&self, lhs: Value, rhs: Value) -> Result<Value, VmError> { lhs.checked_add(rhs).ok_or_else(|| VmError::ArithmeticError("Addition overflow".to_string())) }
     #[inline] fn checked_sub(&self, lhs: Value, rhs: Value) -> Result<Value, VmError> { lhs.checked_sub(rhs).ok_or_else(|| VmError::ArithmeticError("Subtraction overflow".to_string())) }
     #[inline] fn checked_mul(&self, lhs: Value, rhs: Value) -> Result<Value, VmError> { lhs.checked_mul(rhs).ok_or_else(|| VmError::ArithmeticError("Multiplication overflow".to_string())) }
     #[inline] fn checked_div(&self, lhs: Value, rhs: Value) -> Result<Value, VmError> { if rhs == 0 { return Err(VmError::ArithmeticError("Division by zero".to_string())); } lhs.checked_div(rhs).ok_or_else(|| VmError::ArithmeticError("Division overflow (INT_MIN / -1)".to_string())) }
     #[inline] fn checked_rem(&self, lhs: Value, rhs: Value) -> Result<Value, VmError> { if rhs == 0 { return Err(VmError::ArithmeticError("Modulo by zero".to_string())); } lhs.checked_rem(rhs).ok_or_else(|| VmError::ArithmeticError("Modulo overflow (INT_MIN % -1)".to_string())) }
     #[inline] fn checked_neg(&self, val: Value) -> Result<Value, VmError> { val.checked_neg().ok_or_else(|| VmError::ArithmeticError("Negation overflow (INT_MIN)".to_string())) }
-    #[inline] fn checked_shl(&self, lhs: Value, rhs: Value) -> Result<Value, VmError> { if rhs < 0 { return Err(VmError::InvalidShiftAmount(rhs)); } let shift_amount = rhs as u32; lhs.checked_shl(shift_amount).ok_or_else(|| VmError::ArithmeticError("Shift left overflow/invalid amount".to_string())) }
-    #[inline] fn checked_shr(&self, lhs: Value, rhs: Value) -> Result<Value, VmError> { if rhs < 0 { return Err(VmError::InvalidShiftAmount(rhs)); } let shift_amount = rhs as u32; lhs.checked_shr(shift_amount).ok_or_else(|| VmError::ArithmeticError("Shift right overflow/invalid amount".to_string())) }
+    #[inline] fn checked_shl(&self, lhs: Value, rhs: Value) -> Result<Value, VmError> { if rhs < 0 || rhs >= 32 { return Err(VmError::InvalidShiftAmount(rhs)); } lhs.checked_shl(rhs as u32).ok_or_else(|| VmError::ArithmeticError("Shift left overflow/invalid amount".to_string())) }
+    #[inline] fn checked_shr(&self, lhs: Value, rhs: Value) -> Result<Value, VmError> { if rhs < 0 || rhs >= 32 { return Err(VmError::InvalidShiftAmount(rhs)); } lhs.checked_shr(rhs as u32).ok_or_else(|| VmError::ArithmeticError("Shift right overflow/invalid amount".to_string())) }
 
 
     // --- Execution Loop ---
@@ -268,34 +256,45 @@ impl VirtualMachine {
         self.running = true;
         let mut last_error: Option<VmError> = None;
 
+        // Removed the RUN START/END debug prints
+        // println!("[VM RUN START] Initial SP={:X}, BP={:X}", self.sp, self.bp);
+
         while self.running {
-            // Check PC bounds before fetch_instruction
-            if self.pc >= self.code_size {
-                last_error = Some(VmError::PcOutOfBounds);
-                self.running = false;
-                break;
+            if self.pc >= self.code_size { // Check PC bounds
+                if self.pc == self.code_size { self.running = false; break; }
+                else { last_error = Some(VmError::PcOutOfBounds); self.running = false; break; }
             }
-            let current_pc = self.pc; // For error reporting
+
+            let current_pc = self.pc; // PC before fetch
+            // Removed SP_before debug variable
+            // let sp_before = self.sp;
 
             match self.fetch_instruction() {
                 Ok(instruction) => {
-                    if let Err(e) = self.execute(instruction) {
+                    // Removed the BEFORE/AFTER SP debug prints
+                    // println!("[VM RUN] PC:{:04X} SP:{:X} AX:{:X} Instr:{:?}", current_pc, sp_before, self.ax, instruction);
+
+                    let execute_result = self.execute(instruction);
+
+                    // println!("[VM RUN] --- After PC:{:04X} SP:{:X} -> {:X}, AX:{:X}", current_pc, sp_before, self.sp, self.ax);
+
+                    if let Err(e) = execute_result {
                         last_error = Some(e);
-                        self.running = false; // Stop on error
+                        self.running = false;
                     }
                 }
-                Err(e) => {
-                    // Error fetching/decoding instruction itself
+                Err(e) => { // Error during fetch_instruction
+                    // println!("[VM RUN] Error fetching instruction at PC:{:04X}", current_pc); // Removed debug
                     last_error = Some(e);
                     self.running = false;
                 }
             }
-        }
+        } // end while
 
-        // Return AX on clean exit (Exit instruction encountered), or propagate error
+        // println!("[VM RUN END] Final SP={:X}, AX={:X}", self.sp, self.ax); // Removed debug
         match last_error {
-             None => Ok(self.ax), // Normal termination via Exit instruction
-             Some(e) => Err(e),  // Execution stopped due to an error
+             None => Ok(self.ax),
+             Some(e) => Err(e),
         }
     }
 
@@ -307,26 +306,26 @@ impl VirtualMachine {
 
         match instruction {
             Instruction::Nop => { /* Do nothing */ }
-            Instruction::Imm => { self.ax = self.fetch_operand()?; }
-            Instruction::Push => self.push(self.ax)?,
-            Instruction::Exit => { self.running = false; } // Signal clean exit
+            Instruction::Imm => { self.ax = self.fetch_operand()?; } // AX = operand
+            Instruction::Push => self.push(self.ax)?, // Push AX onto stack
+            Instruction::Exit => { self.running = false; } // Signal clean exit for the run loop
 
-            // --- Arithmetic (C4 style: AX = Pop() op AX) ---
+            // --- Arithmetic (AX = Pop() op AX) ---
             Instruction::Add => { let op = self.pop()?; self.ax = self.checked_add(op, self.ax)?; }
             Instruction::Sub => { let op = self.pop()?; self.ax = self.checked_sub(op, self.ax)?; }
             Instruction::Mul => { let op = self.pop()?; self.ax = self.checked_mul(op, self.ax)?; }
             Instruction::Div => { let op = self.pop()?; self.ax = self.checked_div(op, self.ax)?; }
             Instruction::Mod => { let op = self.pop()?; self.ax = self.checked_rem(op, self.ax)?; }
 
-            // --- Bitwise/Logical ---
+            // --- Bitwise/Logical (AX = Pop() op AX) ---
             Instruction::Or => { let op = self.pop()?; self.ax = op | self.ax; }
             Instruction::Xor => { let op = self.pop()?; self.ax = op ^ self.ax; }
             Instruction::And => { let op = self.pop()?; self.ax = op & self.ax; }
-            // --- Shifts --- (AX = Pop() << AX) (Left value = Pop, Right amount = AX)
+            // --- Shifts (AX = Pop() << AX) ---
             Instruction::Shl => { let val = self.pop()?; self.ax = self.checked_shl(val, self.ax)?; }
-            Instruction::Shr => { let val = self.pop()?; self.ax = self.checked_shr(val, self.ax)?; } // Arithmetic shift for i32
+            Instruction::Shr => { let val = self.pop()?; self.ax = self.checked_shr(val, self.ax)?; } // Arithmetic right shift for i32
 
-            // --- Relational/Equality --- (AX = (Pop() op AX) ? 1 : 0)
+            // --- Relational/Equality (AX = (Pop() op AX) ? 1 : 0) ---
             Instruction::Eq => { let op = self.pop()?; self.ax = if op == self.ax { 1 } else { 0 }; }
             Instruction::Ne => { let op = self.pop()?; self.ax = if op != self.ax { 1 } else { 0 }; }
             Instruction::Lt => { let op = self.pop()?; self.ax = if op < self.ax { 1 } else { 0 }; }
@@ -335,8 +334,8 @@ impl VirtualMachine {
             Instruction::Ge => { let op = self.pop()?; self.ax = if op >= self.ax { 1 } else { 0 }; }
 
             // --- Unary ---
-            Instruction::Neg => { self.ax = self.checked_neg(self.ax)?; }
-            Instruction::Not => { self.ax = if self.ax == 0 { 1 } else { 0 }; } // Logical not
+            Instruction::Neg => { self.ax = self.checked_neg(self.ax)?; } // AX = -AX
+            Instruction::Not => { self.ax = if self.ax == 0 { 1 } else { 0 }; } // Logical not: AX = !AX
 
             // --- Control Flow ---
             Instruction::Jmp => { let target = self.fetch_operand()?; self.pc = self.validate_jump_target(target)?; }
@@ -345,117 +344,138 @@ impl VirtualMachine {
 
             // --- Function Call ---
             Instruction::Call => {
-                let target_addr_val = self.fetch_operand()?; // PC now points after operand
+                let target_addr_val = self.fetch_operand()?; // Get target address or syscall ID
 
-                // --- START printf Hook ---
+                // --- Check for built-in printf hook ---
                 if target_addr_val == PRINTF_SYSCALL_ADDR {
-                    // Execute built-in printf logic
-                    let str_addr_val = self.pop()?; // Pop the string address argument
-                    let start_addr = self.validate_data_segment_address(str_addr_val)?; // Validate base addr
+                    // <<< REVERTED printf Hook Logic (Standard C Convention) >>>
+                    // Assumes Parser pushed args R->L: Stack Top has fmt_addr, then arg1, arg2...
 
-                    // Find the null terminator in the data segment
-                    let mut end_addr = start_addr;
-                    while end_addr < self.data_segment.len() && self.data_segment[end_addr] != 0 {
-                        end_addr += 1;
-                    }
+                    // <<< Removed Printf Debug prints >>>
 
-                    // Check if null terminator was found within bounds
-                    if end_addr == self.data_segment.len() && (start_addr == end_addr || self.data_segment[end_addr-1] != 0) {
-                       // String not null-terminated or zero length starting at end
-                       return Err(VmError::DataSegmentAccessError(format!("String starting at {} not null-terminated within data segment", str_addr_val)));
-                    }
+                    // 1. Pop format string address FIRST
+                    let str_addr_val = self.pop()?;
+                    let start_addr = self.validate_data_segment_address(str_addr_val)?;
 
-                    // Slice the data segment and print
-                    let string_slice = &self.data_segment[start_addr..end_addr];
-                    match std::str::from_utf8(string_slice) {
-                        Ok(s) => {
-                            // Use print! to avoid extra newline
-                            print!("{}", s);
-                            // C printf returns the number of characters written
-                            self.ax = s.len() as Value;
+                    // 2. Read format string from data segment
+                    let format_string_bytes: Vec<u8>;
+                    { // Scope for data_segment borrow
+                        let mut end_addr = start_addr;
+                        while end_addr < self.data_segment.len() && self.data_segment[end_addr] != 0 { end_addr += 1; }
+                        if end_addr == self.data_segment.len() && (start_addr == end_addr || self.data_segment.get(end_addr).map_or(true, |&b| b != 0)) {
+                           return Err(VmError::DataSegmentAccessError(format!("String starting at {} not null-terminated within data segment", str_addr_val)));
                         }
-                        Err(_) => {
-                             return Err(VmError::DataSegmentAccessError(format!("Invalid UTF-8 sequence in data segment at address {}", str_addr_val)));
-                        }
+                        format_string_bytes = self.data_segment[start_addr..end_addr].to_vec();
                     }
-                 // --- END printf Hook ---
+                    let format_str = String::from_utf8(format_string_bytes)
+                        .map_err(|_| VmError::DataSegmentAccessError(format!("Invalid UTF-8 sequence in format string at address {}", str_addr_val)))?;
+
+                    // 3. Process format string. Pop arguments as needed.
+                    let mut chars_iter = format_str.chars().peekable();
+                    let mut output_string = String::new();
+                    let mut chars_printed_count = 0;
+
+                    while let Some(c) = chars_iter.next() {
+                        if c == '%' {
+                            match chars_iter.next() {
+                                Some('d') => { // Integer argument
+                                    // Pop the integer argument *now*
+                                    let arg_int_value = self.pop()?;
+                                    let formatted_arg = arg_int_value.to_string();
+                                    output_string.push_str(&formatted_arg);
+                                    chars_printed_count += formatted_arg.len();
+                                }
+                                Some('%') => { // Literal '%'
+                                    output_string.push('%');
+                                    chars_printed_count += 1;
+                                }
+                                Some(other) => { // Unrecognized specifier
+                                     output_string.push('%'); output_string.push(other); chars_printed_count += 2;
+                                }
+                                None => { // String ends with '%'
+                                     output_string.push('%'); chars_printed_count += 1;
+                                }
+                            }
+                        } else {
+                            output_string.push(c);
+                            chars_printed_count += 1;
+                        }
+                    } // End while loop
+
+                    // 4. Print the composed string
+                    print!("{}", output_string);
+
+                    // 5. Set return value in AX
+                    self.ax = chars_printed_count as Value;
+                     // --- END REVERTED printf Hook ---
+
                 } else {
-                    // Regular function call
+                    // --- Regular function call ---
                     let target_pc = self.validate_jump_target(target_addr_val)?;
-                    // Push return address (PC *after* operand) onto the main memory stack
-                    self.push(self.pc as Value)?;
-                    self.pc = target_pc; // Jump to function
+                    self.push(self.pc as Value)?; // Push return address
+                    self.pc = target_pc; // Jump
                 }
             }
-            Instruction::Ent => {
+            Instruction::Ent => { // Enter function: setup stack frame
                 let locals_size = self.fetch_operand()?;
+                // <<< Removed ENT Debug print >>>
+                // println!("[VM DEBUG] ENT instruction executing with locals_size = {}", locals_size);
                 if locals_size < 0 { return Err(VmError::ArithmeticError("ENT operand (locals size) cannot be negative".to_string())); }
                 self.push(self.bp as Value)?;   // Push old base pointer
-                self.bp = self.sp;              // Set new base pointer to current stack top (before locals)
-                // Allocate space for locals by decrementing SP
-                // Check for overflow before subtraction
-                if self.sp < locals_size as usize { return Err(VmError::StackOverflow); }
-                self.sp -= locals_size as usize;
+                self.bp = self.sp;              // Set new base pointer
+                let locals_size_usize = locals_size as usize;
+                if self.sp < locals_size_usize { return Err(VmError::StackOverflow); }
+                self.sp -= locals_size_usize;   // Allocate space for locals
             }
-            Instruction::Adj => {
+            Instruction::Adj => { // Adjust stack pointer
                 let arg_count = self.fetch_operand()?;
                  if arg_count < 0 { return Err(VmError::ArithmeticError("ADJ operand (arg count) cannot be negative".to_string())); }
                  let new_sp = self.sp.checked_add(arg_count as usize);
                  match new_sp {
-                     // Ensure SP doesn't go beyond the initial top
                      Some(sp) if sp <= self.memory_size => self.sp = sp,
-                     _ => return Err(VmError::StackUnderflow), // Adjusting stack pointer went out of bounds
+                     _ => return Err(VmError::StackUnderflow),
                  }
             }
-            Instruction::Lev => {
-                self.sp = self.bp;              // Deallocate locals, SP points to saved BP
-                self.bp = self.pop()? as usize; // Restore old base pointer (pop BP) - cast assumes valid BP was pushed
-                let return_pc_val = self.pop()?; // Pop return address
-                self.pc = self.validate_jump_target(return_pc_val)?; // Jump back
+            Instruction::Lev => { // Leave function
+                 if self.bp >= self.memory_size { return Err(VmError::StackUnderflow); }
+                 self.sp = self.bp;              // Deallocate locals
+                 self.bp = self.pop()? as usize; // Restore old BP
+                 let return_pc_val = self.pop()?; // Pop return address
+                 self.pc = self.validate_jump_target(return_pc_val)?; // Jump back
             }
 
-            // --- Memory Access (Using `memory`) ---
-            Instruction::Lea => {
+            // --- Memory Access ---
+            Instruction::Lea => { // Load Effective Address
                 let offset = self.fetch_operand()?;
-                // LEA calculates address BP + offset. BP points to the location *of the saved BP*.
-                // Arguments are usually at BP+N, locals at BP-N (or SP based). C4's LEA is often BP+offset.
-                let base = self.bp as Value; // BP is a stack index, treat as Value for calculation
-                // Use checked_add for safety
+                let base = self.bp as Value;
                 self.ax = self.checked_add(base, offset)?;
-                // Address calculated is stored in AX. Validation happens when used by LI/SI etc.
             }
-            Instruction::Li => { // Load Integer from memory[AX]
+            Instruction::Li => { // Load Integer
                 let addr = self.validate_memory_word_address(self.ax)?;
                 self.ax = self.memory[addr];
             }
-            Instruction::Lc => { // Load Character from memory[AX] (low byte)
-                 let addr = self.validate_memory_byte_address(self.ax)?; // Validate word addr
-                 // Read the word and mask to get the lower byte, zero-extend.
+            Instruction::Lc => { // Load Character
+                 let addr = self.validate_memory_byte_address(self.ax)?;
                  self.ax = self.memory[addr] & 0xFF;
             }
-            Instruction::Si => { // Store Integer AX into memory[Pop()]
-                // C4 source: *--sp = ax; ax = bp; *--sp = bp; bp = --sp; *bp = *ax;
-                // C4 description often says Mem[Pop()] = AX or Mem[AX] = Pop(). Let's use Mem[Pop()] = AX
+            Instruction::Si => { // Store Integer
                  let addr_val = self.pop()?;
                  let addr = self.validate_memory_word_address(addr_val)?;
                  self.memory[addr] = self.ax;
             }
-            Instruction::Sc => { // Store Character (low byte of AX) into memory[Pop()]
+            Instruction::Sc => { // Store Character
                  let addr_val = self.pop()?;
-                 let addr = self.validate_memory_byte_address(addr_val)?; // Validate word addr
-                 // Store only the lower byte into the target word address
-                 // This overwrites parts of the existing value at memory[addr]
+                 let addr = self.validate_memory_byte_address(addr_val)?;
                  let current_val = self.memory[addr];
                  let low_byte_ax = self.ax & 0xFF;
-                 self.memory[addr] = (current_val & !0xFF) | low_byte_ax; // Clear low byte, OR in new byte
+                 self.memory[addr] = (current_val & !0xFF) | low_byte_ax;
             }
         } // end match instruction
         Ok(())
     }
 
     // --- Debugging Helpers ---
-    // (Keep your existing dump_registers and dump_stack if needed)
-    #[allow(dead_code)]
+     #[allow(dead_code)]
     pub fn dump_registers(&self) {
         println!("--- Registers ---");
         println!("  PC: {:04X} ({})", self.pc, self.pc);
@@ -470,16 +490,15 @@ impl VirtualMachine {
         println!("--- Stack Top (max {} entries) ---", count);
         println!("  SP -> 0x{:X} (Memory Index {})", self.sp, self.sp);
         let start = self.sp;
-        let end = (start + count).min(self.memory_size); // Don't go past physical end
+        let end = start.saturating_add(count).min(self.memory_size);
+
         if start >= self.memory_size {
              println!("  (Stack Empty or SP points beyond memory)");
         } else if start >= end {
-             println!("  (SP points near end, showing 0 entries)");
+             println!("  (SP points at end or count is 0, showing 0 entries)");
         }
          else {
-            // Print from SP upwards towards higher indices (lower on stack)
             for i in start..end {
-                // Addresses increase going "up" the stack visually here
                 println!("  [Mem Idx 0x{:X}] {:08X} ({})", i, self.memory[i], self.memory[i]);
             }
         }
@@ -489,11 +508,16 @@ impl VirtualMachine {
      #[allow(dead_code)]
      pub fn dump_data_segment(&self) {
          println!("--- Data Segment ({} bytes) ---", self.data_segment.len());
-         // Simple hex dump view
-         for (i, byte) in self.data_segment.iter().enumerate() {
-             if i % 16 == 0 { print!("\n  {:04X}: ", i); }
-             print!("{:02X} ", byte);
+         const BYTES_PER_LINE: usize = 16;
+         for (i, chunk) in self.data_segment.chunks(BYTES_PER_LINE).enumerate() {
+             print!("  {:04X}: ", i * BYTES_PER_LINE); // Print address offset
+             for byte in chunk { print!("{:02X} ", byte); }
+             if chunk.len() < BYTES_PER_LINE { for _ in 0..(BYTES_PER_LINE - chunk.len()) { print!("   "); } }
+             print!(" |");
+             for byte in chunk { print!("{}", if *byte >= 32 && *byte <= 126 { *byte as char } else { '.' }); }
+             println!("|");
          }
-         println!("\n----------------------------");
+         if self.data_segment.is_empty() { println!("  (Empty)"); }
+         println!("----------------------------");
      }
 }

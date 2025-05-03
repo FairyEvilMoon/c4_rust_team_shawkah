@@ -234,8 +234,10 @@ impl<'a> Lexer<'a> {
         let mut literal = String::new();
         loop {
             // Capture position before consuming potentially problematic char (like '\' or '"')
-            let current_line = self.current_line;
-            let current_col = self.current_col;
+            // FIX: Prefix with underscore as these are only used for potential immediate errors below
+            let _current_line = self.current_line; // Prefixed
+            let _current_col = self.current_col;  // Prefixed
+
             match self.consume() {
                 Some('"') => {
                     // End of string literal
@@ -243,8 +245,9 @@ impl<'a> Lexer<'a> {
                 }
                 Some('\\') => {
                     // Handle escape sequence
-                    let escape_line = self.current_line; // Position of the char *after* backslash
-                    let escape_col = self.current_col;
+                    // We need the position *after* the backslash for accurate error reporting
+                    let escape_char_line = self.current_line;
+                    let escape_char_col = self.current_col;
                     match self.consume() {
                         Some('n') => literal.push('\n'),
                         Some('t') => literal.push('\t'),
@@ -253,7 +256,8 @@ impl<'a> Lexer<'a> {
                         Some('0') => literal.push('\0'),
                         // Other C escapes like \r, \a, \b, \f, \v are less common in simple subsets
                         Some(other) => {
-                            return Err(LexerError::InvalidEscapeSequence(other, escape_line, escape_col));
+                            // Use the position of the character *following* the backslash
+                            return Err(LexerError::InvalidEscapeSequence(other, escape_char_line, escape_char_col));
                         }
                         None => {
                             // EOF right after backslash
@@ -263,8 +267,10 @@ impl<'a> Lexer<'a> {
                 }
                 Some(c) => {
                     if c == '\n' {
-                         // Unescaped newline inside string literal is usually an error in C
-                         // Return error based on the position where the newline was found
+                         // Unescaped newline inside string literal is usually an error in C.
+                         // Report the error starting from the beginning of the literal.
+                         // Using _current_line/_current_col here would point to the newline itself,
+                         // but usually the error points to the start.
                          return Err(LexerError::UnterminatedString(start_line, start_col));
                     }
                     literal.push(c);

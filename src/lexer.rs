@@ -85,11 +85,12 @@ impl std::fmt::Display for LexerError {
 impl std::error::Error for LexerError {}
 
 // --- Lexer Implementation ---
+#[derive(Clone)]
 pub struct Lexer<'a> {
     input: Peekable<Chars<'a>>,
     current_line: usize,
     current_col: usize,
-    // Removed byte position trackers for simplicity, rely on line/col
+    current_token_info: Option<TokenInfo>,
 }
 
 impl<'a> Lexer<'a> {
@@ -98,6 +99,7 @@ impl<'a> Lexer<'a> {
             input: input.chars().peekable(),
             current_line: 1,
             current_col: 1,
+            current_token_info: None,
         }
     }
 
@@ -123,35 +125,97 @@ impl<'a> Lexer<'a> {
         self.input.peek()
     }
 
-    // Removed consume_if_eq as it was causing borrow issues in next_token
-
     #[inline]
      fn token_info(&self, token: Token, start_line: usize, start_col: usize) -> TokenInfo {
         TokenInfo { token, line: start_line, column: start_col }
      }
 
+    /// Reads a number literal, handling decimal, hexadecimal, and octal.
     fn read_number(&mut self, first_char: char, start_line: usize, start_col: usize) -> Result<TokenInfo, LexerError> {
         let mut number_str = String::new();
         number_str.push(first_char);
-        let base = 10; // Assume decimal unless prefix indicates otherwise
+        let mut base = 10; // Default to decimal
 
-        // C4 doesn't explicitly support 0x or 0 prefixes for hex/octal in its grammar description,
-        // but the code handles it. Let's keep the simpler C4 lexer logic first.
-        // Revert to simpler C4 logic (no hex/octal detection here):
-        while let Some(&c) = self.peek() {
-            if c.is_ascii_digit() {
-                 number_str.push(self.consume().unwrap());
-            } else {
-                break;
+        // Check for prefixes
+        if first_char == '0' {
+            if let Some(&'x') | Some(&'X') = self.peek() {
+                // Hexadecimal prefix (0x or 0X)
+                base = 16;
+                number_str.push(self.consume().unwrap()); // Consume 'x' or 'X'
+                 // Read hex digits (0-9, a-f, A-F)
+                while let Some(&c) = self.peek() {
+                    if c.is_ascii_hexdigit() {
+                        number_str.push(self.consume().unwrap());
+                    } else {
+                        break;
+                    }
+                }
+            } else if self.peek().map_or(false, |c| c.is_ascii_digit()) {
+                // Octal prefix (0 followed by digits 0-7)
+                // Note: If '0' is followed by non-digit, it's just the number 0 (decimal)
+                base = 8;
+                // Read octal digits (0-7)
+                while let Some(&c) = self.peek() {
+                    if ('0'..='7').contains(&c) {
+                        number_str.push(self.consume().unwrap());
+                    } else if c.is_ascii_digit() { // Found 8 or 9? Invalid octal.
+                        // Consume the invalid digit to show it in the error
+                        number_str.push(self.consume().unwrap());
+                        return Err(LexerError::InvalidNumberFormat(number_str, start_line, start_col));
+                    }
+                    else {
+                        break;
+                    }
+                }
+            }
+             // else: Just the number '0', handled below as decimal.
+        }
+
+        // If decimal (no prefix or just '0'), read remaining digits
+        if base == 10 {
+            while let Some(&c) = self.peek() {
+                if c.is_ascii_digit() {
+                    number_str.push(self.consume().unwrap());
+                } else {
+                    break;
+                }
             }
         }
-        // C4 code itself has hex/octal parsing logic, which is complex.
-        // Let's stick to decimal for now unless C4 code parsing fails.
-        match number_str.parse::<i64>() {
-             Ok(num) => Ok(self.token_info(Token::Number(num), start_line, start_col)),
-             Err(_) => Err(LexerError::InvalidNumberFormat(number_str, start_line, start_col)),
+
+        // --- Parse the collected string based on the determined base ---
+        let value = match base {
+            16 => {
+                // Need to strip "0x" or "0X" prefix before parsing
+                 let num_part = number_str.strip_prefix("0x").or_else(|| number_str.strip_prefix("0X")).unwrap_or(&number_str);
+                 if num_part.is_empty() { // Case like "0x" with no digits
+                     return Err(LexerError::InvalidNumberFormat(number_str, start_line, start_col));
+                 }
+                 i64::from_str_radix(num_part, 16)
+            }
+             8 => {
+                 // Octal parsing might need "0" prefix stripped if from_str_radix requires it,
+                 // but Rust's from_str_radix generally handles the number part directly.
+                 // Let's test without stripping "0" first.
+                 // If the string starts with '0' and has only '0', it's just 0.
+                 if number_str.chars().all(|c| c == '0') && number_str.len() > 1 {
+                     // Multiple zeros like "000" is still 0 in octal/decimal.
+                     i64::from_str_radix(&number_str, 8) // Treat as octal 0
+                 } else {
+                    // If number_str is just "0", parse as base 8 (yields 0).
+                    // If it's "0123", parse "0123" as base 8.
+                    i64::from_str_radix(&number_str, 8)
+                 }
+             }
+            10 => {
+                number_str.parse::<i64>() // Standard decimal parsing
+            }
+            _ => unreachable!("Invalid base determined"),
+        };
+
+        match value {
+            Ok(num) => Ok(self.token_info(Token::Number(num), start_line, start_col)),
+            Err(_) => Err(LexerError::InvalidNumberFormat(number_str, start_line, start_col)),
         }
-        // TODO: Add hex/octal parsing logic from C4 if needed later, mirroring its complexity.
     }
 
 
@@ -201,7 +265,7 @@ impl<'a> Lexer<'a> {
                         Some('t') => literal.push('\t'),
                         Some('\\') => literal.push('\\'),
                         Some('"') => literal.push('"'),
-                        Some('0') => literal.push('\0'),
+                        Some('0') => literal.push('\0'), // Handle null character escape
                         // C4 doesn't handle other escapes like \' in strings
                         Some(other) => return Err(LexerError::InvalidEscapeSequence(other, esc_seq_line, esc_seq_col)),
                         None => return Err(LexerError::UnterminatedString(start_line, start_col)),
@@ -225,7 +289,7 @@ impl<'a> Lexer<'a> {
                     Some('t') => '\t',
                     Some('\\') => '\\',
                     Some('\'') => '\'', // Allow \' within char literal
-                    Some('0') => '\0',
+                    Some('0') => '\0', // Handle null character escape
                     Some(other) => return Err(LexerError::InvalidEscapeSequence(other, escape_line, escape_col)),
                     None => return Err(LexerError::UnterminatedChar(start_line, start_col)),
                 }
@@ -265,12 +329,12 @@ impl<'a> Lexer<'a> {
             if self.peek() == Some(&'/') {
                 // Clone iterator to peek ahead without consuming the first '/' yet
                 let mut chars_clone = self.input.clone();
-                chars_clone.next();
+                chars_clone.next(); // Consume the first '/' in the clone
 
                 match chars_clone.peek() {
                     Some(&'/') => { // Line comment "//"
-                        self.consume(); // Consume first '/'
-                        self.consume(); // Consume second '/'
+                        self.consume(); // Consume first '/' from original
+                        self.consume(); // Consume second '/' from original
                         while let Some(c) = self.consume() {
                             if c == '\n' { break; }
                         }
@@ -279,8 +343,8 @@ impl<'a> Lexer<'a> {
                     Some(&'*') => { // Block comment "/*"
                         let comment_start_line = self.current_line;
                         let comment_start_col = self.current_col;
-                        self.consume(); // Consume '/'
-                        self.consume(); // Consume '*'
+                        self.consume(); // Consume '/' from original
+                        self.consume(); // Consume '*' from original
                         let mut maybe_end = false;
                         loop {
                             match self.consume() {
@@ -352,7 +416,7 @@ impl<'a> Lexer<'a> {
 
                 // Single-char operators and punctuation
                 '*' => Ok(self.token_info(Token::Asterisk, start_line, start_col)),
-                '/' => Ok(self.token_info(Token::Div, start_line, start_col)), // Comments handled
+                '/' => Ok(self.token_info(Token::Div, start_line, start_col)), // Comments handled earlier
                 '%' => Ok(self.token_info(Token::Mod, start_line, start_col)),
                 '^' => Ok(self.token_info(Token::BitXor, start_line, start_col)),
                 '~' => Ok(self.token_info(Token::BitNot, start_line, start_col)),
@@ -371,7 +435,7 @@ impl<'a> Lexer<'a> {
                 '"' => self.read_string_literal(start_line, start_col),
                 '\'' => self.read_char_literal(start_line, start_col),
 
-                // Numbers (simple decimal for now, based on C4 lexer)
+                // Numbers (handles decimal, octal, hex)
                 c @ '0'..='9' => self.read_number(c, start_line, start_col),
 
                 // Identifiers or Keywords
@@ -395,12 +459,31 @@ impl<'a> Iterator for Lexer<'a> {
         match self.next_token() {
             Ok(token_info) => {
                 if token_info.token == Token::Eof {
-                    None // Stop iteration after EOF token is generated
+                    // Emit one EOF token, then stop iteration
+                    // Check if we already emitted EOF to avoid infinite loop
+                    if self.current_token_info.as_ref().map_or(false, |ti| ti.token == Token::Eof) {
+                        None
+                    } else {
+                        self.current_token_info = Some(token_info.clone()); // Store the EOF info
+                        Some(Ok(token_info))
+                    }
                 } else {
+                    self.current_token_info = Some(token_info.clone()); // Store current token info
                     Some(Ok(token_info)) // Return valid token
                 }
             }
             Err(e) => Some(Err(e)), // Return lexer error
         }
     }
+}
+
+// Add a field to Lexer to track the last emitted token if needed for EOF handling in iterator
+impl<'a> Lexer<'a> {
+    // Add this field to the Lexer struct definition
+    // current_token_info: Option<TokenInfo>, // Tracks the last emitted token
+
+    // Initialize it in new()
+    // current_token_info: None,
+
+    // Update it in the iterator's next() method (as shown above)
 }

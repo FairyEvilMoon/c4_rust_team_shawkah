@@ -1,1174 +1,452 @@
-//! Parser for the C4 language subset.
-extern crate lexer;
-use crate::lexer::{Lexer, Token, LexerError};
-use crate::vm::Instruction;
-use crate::symbol::{SymbolTable, SymbolEntry, SymbolClass, DataType};
+//! Minimal Parser for C4 subset, focusing on 'hello world'.
+//! Directly emits VM instructions.
+
+use crate::lexer::{Lexer, Token, TokenInfo, LexerError};
+// Removed unused SymbolEntry import
+use crate::symbol::{SymbolTable, SymbolClass, DataType};
+use crate::vm::{Instruction, Value}; // Assuming VM instructions are i32
 use std::iter::Peekable;
-use std::mem; // For mem::discriminant
-extern crate libc;
-use libc::*;
 
-// Operator Precedence Levels (Matching C4's enum order)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum Precedence {
-    P0_Lowest = 0, // Sentinel
-    Assign,     // =
-    Cond,       // ?:
-    LogOr,      // ||
-    LogAnd,     // &&
-    BitOr,      // |
-    BitXor,     // ^
-    BitAnd,     // &
-    Eq, Ne,     // ==, !=
-    Lt, Gt, Le, Ge, // <, >, <=, >=
-    Shl, Shr,   // <<, >>
-    Add, Sub,   // +, -
-    Mul, Div, Mod, // *, /, %
-    Unary,     // ++, -- (prefix), !, ~, *(deref), &(addr), sizeof
-    Postfix,    // ++, -- (postfix), [], () (call)
-    Primary,    // Literals, identifiers, (...)
-}
-
-// Map tokens to precedence - based on C4 `expr` logic
-fn token_precedence(token: &Token) -> Precedence {
-    match token {
-        Token::Assign => Precedence::Assign,
-        // Token::Cond => Precedence::Cond, 
-        // ?: handled specially
-        Token::LogOr => Precedence::LogOr,
-        Token::LogAnd => Precedence::LogAnd,
-        Token::BitOr => Precedence::BitOr,
-        Token::BitXor => Precedence::BitXor,
-        Token::Ampersand | Token::BitAnd => Precedence::BitAnd, // Need context for &
-        Token::Eq => Precedence::Eq, Token::Ne => Precedence::Ne,
-        Token::Lt => Precedence::Lt, Token::Gt => Precedence::Gt, Token::Le => Precedence::Le, Token::Ge => Precedence::Ge,
-        Token::Shl => Precedence::Shl, Token::Shr => Precedence::Shr,
-        Token::Add => Precedence::Add, Token::Sub => Precedence::Sub,
-        Token::Asterisk | Token::Mul => Precedence::Mul, // Need context for *
-        Token::Div => Precedence::Mul, Token::Mod => Precedence::Mul,
-        Token::Inc | Token::Dec => Precedence::Unary, // Or Postfix depending on context
-        Token::LBracket => Precedence::Postfix, // Array subscript
-        Token::LParen => Precedence::Postfix, // Function call or grouping
-        _ => Precedence::P0_Lowest,
-    }
-
-}
-
-// Define Parser errors
+// --- Parser Error ---
+// Removed Eq derive because Token contains String which is not Eq
 #[derive(Debug, Clone, PartialEq)]
-pub enum ParserError {
+pub enum ParseError {
     LexerError(LexerError),
-    UnexpectedToken(Token, String),
-    UnexpectedEOF,
-    UndefinedSymbol(String),
-    Redefinition(String),
-    NotImplemented(String),
-    TypeError(String),
-    SyntaxError(String),
-    InternalError(String), // For unexpected internal states
+    UnexpectedToken {
+        expected: String, // Description of expected token(s)
+        found: Token,
+        line: usize,
+        column: usize,
+    },
+    UndefinedSymbol(String, usize, usize), // Name, line, col
+    NotAFunction(String, usize, usize),    // Name, line, col
+    EndOfInput, // Reached end of input unexpectedly
+    ExpectedEOF, // Expected EOF but found more tokens
+    Other(String), // Generic error
 }
 
-// Convert LexerError to ParserError
-impl From<LexerError> for ParserError {
+// Conversion from LexerError to ParseError
+impl From<LexerError> for ParseError {
     fn from(err: LexerError) -> Self {
-        ParserError::LexerError(err)
+        ParseError::LexerError(err)
     }
 }
 
-// Parser structure
+impl std::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ParseError::LexerError(e) => write!(f, "Lexer error: {}", e),
+            ParseError::UnexpectedToken { expected, found, line, column } => {
+                write!(f, "Parse error at {}:{}: Expected {}, found {:?}", line, column, expected, found)
+            }
+            ParseError::UndefinedSymbol(name, line, col) => {
+                write!(f, "Parse error at {}:{}: Undefined symbol '{}'", line, col, name)
+            }
+             ParseError::NotAFunction(name, line, col) => {
+                write!(f, "Parse error at {}:{}: '{}' is not a function", line, col, name)
+            }
+            ParseError::EndOfInput => write!(f, "Parse error: Unexpected end of input"),
+            ParseError::ExpectedEOF => write!(f, "Parse error: Expected end of file but found more tokens"),
+            ParseError::Other(msg) => write!(f, "Parse error: {}", msg),
+        }
+    }
+}
+
+impl std::error::Error for ParseError {}
+
+// --- Parser Implementation ---
+
+// Type alias for convenience
+type ParseResult<T> = Result<T, ParseError>;
+
 pub struct Parser<'a> {
-    lexer: Peekable<Lexer<'a>>,
-    current_token: Token,
-    code: Vec<i64>, // Vector of instructions
-    symbols: SymbolTable,
-    data_segment: Vec<u8>, // For string literals, etc.
-    main_entry_point: Option<usize>, // Entry point for main function
-
-    // Scope information
-    local_offset: usize, // Offset for local variables
+    tokens: Peekable<Lexer<'a>>,
+    symbol_table: SymbolTable,
+    code: Vec<Value>,      // Bytecode for the VM
+    data_segment: Vec<u8>, // To store string literals
+    current_token_info: Option<TokenInfo>, // Stores the *last consumed* token info for error reporting
+    entry_point: Option<Value>, // Address of the main function
 }
+
 impl<'a> Parser<'a> {
-    pub fn new(mut lexer: Lexer<'a>) -> Result<Self, ParserError> {
-        let first_token = lexer.next_token()?;
-        Ok(Parser {
-            lexer: lexer.peekable(),
-            current_token: first_token,
+    pub fn new(lexer: Lexer<'a>) -> Self {
+        let mut symbol_table = SymbolTable::new();
+
+        // Pre-register built-in functions like printf
+        // Using PRINTF_SYSCALL_ADDR (-1) as a special value for the VM hook.
+        const PRINTF_SYSCALL_ADDR: i64 = -1; // Needs to be i64 for symbol table
+        symbol_table.add(
+            "printf".to_string(),
+            Token::Ident("printf".to_string()), // Placeholder token
+            SymbolClass::Sys, // System call/built-in
+            DataType::Int, // Standard C printf returns int
+            PRINTF_SYSCALL_ADDR, // Special value indicating built-in/syscall
+        ).expect("Failed to add built-in printf");
+
+        Parser {
+            tokens: lexer.peekable(),
+            symbol_table,
             code: Vec::new(),
-            symbols: SymbolTable::new(),
             data_segment: Vec::new(),
-            main_entry_point: None,
-            local_offset: 0,
-        })
-    }
-
-    // --- Token Handling ---
-    fn consume(&mut self) -> Result<(), ParserError> {
-        if self.current_token == Token::EOF {
-            return Err(ParserError::UnexpectedEOF);
+            current_token_info: None,
+            entry_point: None,
         }
-        // Advance the lexer before updating the current token
-        let next = self.lexer.next().unwrap_or(Ok(Token::EOF))?;
-        self.current_token = next;
-        Ok(())
     }
 
-    // Check if the current token matches the expected token
-    fn expect(&mut self, expected: Token) -> Result<(), ParserError> {
-        // Use mem::discriminant to compare enum variants without comparing contained values
-        if mem::discriminant(&self.current_token) == mem::discriminant(&expected) {
-            self.consume()
+    /// Consumes the next token from the lexer.
+    /// Returns the TokenInfo or a ParseError.
+    /// Updates `current_token_info` for error context.
+    /// Returns EndOfInput error ONLY if the underlying lexer iterator returns None *before* EOF token.
+    /// Successfully consuming the EOF token is handled by the caller checking token_info.token.
+    fn next_token(&mut self) -> ParseResult<TokenInfo> {
+        match self.tokens.next() {
+            Some(Ok(token_info)) => {
+                self.current_token_info = Some(token_info.clone());
+                Ok(token_info) // Return the token info (could be EOF)
+            }
+            Some(Err(lex_err)) => Err(ParseError::LexerError(lex_err)),
+            None => {
+                 // This path means the Lexer iterator finished without yielding EOF explicitly.
+                 // This *shouldn't* happen with the current Lexer impl, which yields EOF once.
+                 // If it does, treat it as unexpected end.
+                 Err(ParseError::EndOfInput)
+            }
+        }
+    }
+
+     /// Peeks at the next token without consuming it.
+     /// Returns Ok(Some(&Token)) if a token is available (could be EOF).
+     /// Returns Ok(None) if the stream is exhausted *after* EOF was yielded.
+     /// Returns Err(ParseError) if lexing fails.
+     fn peek_token(&mut self) -> ParseResult<Option<&Token>> {
+         match self.tokens.peek() {
+             Some(Ok(token_info)) => Ok(Some(&token_info.token)), // Return ref to token
+             Some(Err(lex_err)) => Err(ParseError::LexerError(lex_err.clone())), // Clone error
+             None => Ok(None), // Iterator end (after EOF token was processed)
+         }
+     }
+
+    /// Gets the position (line, col) from the last consumed token, or default (0,0).
+    fn current_pos(&self) -> (usize, usize) {
+        self.current_token_info.as_ref().map_or((0, 0), |ti| (ti.line, ti.column))
+    }
+
+     /// Expects a specific token, consumes it if matches, otherwise returns error.
+     /// Handles EOF correctly - if EOF is expected, it succeeds.
+     fn expect_token(&mut self, expected_token: Token, expected_desc: &str) -> ParseResult<TokenInfo> {
+         let token_info = self.next_token()?; // Consumes the next token
+         if token_info.token == expected_token {
+             Ok(token_info)
+         } else {
+            // If next_token returned EOF but it wasn't expected
+            if token_info.token == Token::Eof {
+                return Err(ParseError::EndOfInput); // Unexpected end of input
+            }
+             Err(ParseError::UnexpectedToken {
+                 expected: expected_desc.to_string(),
+                 found: token_info.token,
+                 line: token_info.line,
+                 column: token_info.column,
+             })
+         }
+     }
+
+    /// Expects an identifier token, consumes it, and returns its name.
+    fn expect_identifier(&mut self, expected_desc: &str) -> ParseResult<(String, TokenInfo)> {
+        let token_info = self.next_token()?;
+        if let Token::Ident(name) = token_info.token.clone() { // Clone name
+            Ok((name, token_info))
         } else {
-            let description = format!("{:?}", expected);
-            Err(ParserError::UnexpectedToken(self.current_token.clone(), description))
+             // Handle EOF case more specifically if needed
+            if token_info.token == Token::Eof {
+                 return Err(ParseError::EndOfInput);
+             }
+            Err(ParseError::UnexpectedToken {
+                expected: expected_desc.to_string(),
+                found: token_info.token,
+                line: token_info.line,
+                column: token_info.column,
+            })
         }
     }
 
-    // Check if the current token matches
-    fn check(&self, expected: &Token) -> bool {
-        mem::discriminant(&self.current_token) == mem::discriminant(&expected)
-    }
 
-    // Peeks at the next token without consuming the current one
-    fn peek(&mut self) -> Result<&Token, ParserError> {
-        match self.lexer.peek() {
-            Some(Ok(token)) => Ok(token),
-            Some(Err(err)) => Err(ParserError::LexerError(err.clone())),
-            None => Ok(&Token::EOF),
-        }
-    }
-
-    // --- Code Emission Helpers ---
-    
-    // Emit a single instruction
-    #[inline]
+    /// Emits a single VM instruction (opcode only).
     fn emit(&mut self, instruction: Instruction) {
-        self.code.push(instruction as i64);
+        self.code.push(instruction as Value);
     }
 
-    // Emit an instruction opcode followed by its operand
-    #[inline]
-    fn emit_operand(&mut self, instruction: Instruction, operand: i64) {
-        self.code.push(instruction as i64);
+    /// Emits a VM instruction followed by its operand.
+    fn emit_with_operand(&mut self, instruction: Instruction, operand: Value) {
+        self.code.push(instruction as Value);
         self.code.push(operand);
     }
 
-    // Get the next available code address
-    #[inline]
-    fn next_code_addr(&self) -> usize {
-        self.code.len()
+    /// Adds a string literal to the data segment and returns its address (index).
+    /// Note: VM addresses are Value (i32), data segment indices are usize. Ensure compatibility.
+    fn add_string_literal(&mut self, literal: &str) -> Value {
+        let address = self.data_segment.len();
+        self.data_segment.extend_from_slice(literal.as_bytes());
+        self.data_segment.push(0); // Null-terminate the string in the data segment
+
+        // Important: Check if the address fits within Value (i32) range
+        if address > i32::MAX as usize {
+            // This should not happen in reasonable programs, but good practice
+            panic!("Data segment address exceeds i32::MAX!");
+        }
+        address as Value // Return the starting address as i32
     }
 
-    // Patch a previously emitted instruction operand (e.g., for jumps)
-    #[inline]
-    fn patch_jump(&mut self, jump_instruction_addr: usize, target_addr: usize) -> Result<(), ParserError> {
-        // Check bounds more carefully
-        if jump_instruction_addr >= self.code.len() || jump_instruction_addr.checked_add(1).is_none() || jump_instruction_addr + 1 >= self.code.len() {
-             // Use return Err to fix type inference issue E0282
-             return Err(ParserError::InternalError(format!(
-                 "Jump address {} out of bounds for patching (code len {})",
-                 jump_instruction_addr, self.code.len()
-             )));
-        }
-        self.code[jump_instruction_addr + 1] = target_addr as i64;
-        Ok(())
-    }
+    // --- Parsing Rules ---
 
-    // --- Symbol Table Management ---
-    fn add_global_data(&mut self, bytes: &[u8]) -> usize {
-        let addr = self.data_segment.len();
-        self.data_segment.extend_from_slice(bytes);
-        // Align data segment to word boundary
-        while self.data_segment.len() % mem::size_of::<i64>() != 0 {
-            self.data_segment.push(0);
-        }
-        addr
-    }
+    /// Parses the entire program (currently just one function: main).
+/// Parses the entire program (currently just one function: main).
+pub fn parse_program(mut self) -> ParseResult<(Vec<Value>, Vec<u8>, Value)> {
+    // Define preamble instructions SIZE
+    const PREAMBLE_SIZE: usize = 3; // CALL, ADDR, EXIT
 
-    // --- Parsing Functions ---
+    // --- Parse main function FIRST ---
+    // This populates self.code with instructions for main, starting at index 0 WITHIN self.code.
+    // It also populates self.symbol_table with main's relative address (0).
+    self.parse_global_declaration()?;
 
-    // Parse the entire input source code
-    pub fn parse(&mut self) -> Result<(Vec<i64>, Option<usize>, Vec<u8>), ParserError> {
-        self.add_builtins()?; // Add built-in functions (printf, exit, etc.) to the symbol table
-        while self.current_token != Token::EOF {
-            self.parse_global_declaration()?;
-        }
-        
-        if self.main_entry_point.is_none() {
-            return Err(ParserError::UndefinedSymbol("main() function not defined".to_string()));
-        }
-        Ok((self.code.clone(), self.main_entry_point, self.data_segment.clone()))
-    }
-
-    fn add_builtins(&mut self) -> Result<(), ParserError> {
-        // Add keywords first
-        let keywords = [
-            ("char", Token::Char), ("else", Token::Else), ("enum", Token::Enum),
-            ("if", Token::If), ("int", Token::Int), ("return", Token::Return),
-            ("sizeof", Token::Sizeof), ("while", Token::While),
-        ];
-        let builtins = [
-            ("open", Instruction::OPEN), ("read", Instruction::READ), ("close", Instruction::CLOS),
-            ("printf", Instruction::PRTF), ("malloc", Instruction::MALC), ("free", Instruction::FREE),
-            ("memset", Instruction::MSET), ("memcmp", Instruction::MCMP), ("exit", Instruction::EXIT),
-        ];
-        for (name, instr) in builtins.iter() {
-            self.symbols.add(
-                name.to_string(),
-                Token::Ident(name.to_string()),
-                SymbolClass::Sys,
-                DataType::Int,
-                *instr as i64,
-            )?;
-        }
-
-        for (name, token) in keywords.iter() {
-            self.symbols.add(
-                name.to_string(),
-                token.clone(),
-                SymbolClass::Key,
-                DataType::Void,
-                0,
-            )?;
-        }
-
-        Ok(())
-    }
-
-    // Parse a global declaration
-    fn parse_global_declaration(&mut self) -> Result<(), ParserError> {
-        let base_type = match self.current_token {
-            Token::Enum => return self.parse_enum_declaration(), // Enums handled separately
-            Token::Int => { self.consume()?; DataType::Int },
-            Token::Char => { self.consume()?; DataType::Char },
-            // Assume int if no type specifier (implicit int - C style, C4 allows this)
-            Token::Asterisk | Token::Ident(_) => DataType::Int,
-            _ => return Err(ParserError::UnexpectedToken(self.current_token.clone(), "type specifier or identifier".to_string())),
-        };
-
-        // Parse potential pointers and the identifier name
-        let (mut current_type, ident_name) = self.parse_type_and_identifier(base_type)?;
-
-        // Function definition or global variable?
-        if self.check(&Token::LParen) {
-            // Function definition
-            self.parse_function_definition(ident_name, current_type)?;
-        } else {
-            // Global variable declaration list
-             loop {
-                 // Define the global variable
-                 let data_addr = self.data_segment.len() as i64;
-                  // Allocate space in data segment based on type size
-                  let size = current_type.size_of() as usize;
-                  self.data_segment.resize(self.data_segment.len() + size, 0);
-                   // Align data segment to word boundary
-                  while self.data_segment.len() % mem::size_of::<i64>() != 0 {
-                    self.data_segment.push(0);
-                  }
-
-
-                 self.symbols.add(
-                     ident_name.clone(),
-                     Token::Ident(ident_name.clone()), // Store the original token type
-                     SymbolClass::Glo,
-                     current_type.clone(),
-                     data_addr, // Value is the address in the data segment
-                 ).map_err(|e| ParserError::Redefinition(e))?;
-
-
-                 // Check for more declarations in the same line
-                 if self.check(&Token::Comma) {
-                      self.consume()?; // Consume comma
-                      // Parse next variable in the list (re-uses base_type)
-                      let (next_type, next_name) = self.parse_type_and_identifier(base_type)?;
-                      current_type = next_type;
-                      ident_name = next_name;
-                 } else {
-                     break;
+    // --- Check for end of input AFTER main is parsed ---
+    match self.peek_token() {
+         Ok(None) => { /* Expected state: stream exhausted */ }
+         Ok(Some(_token)) => { // Use _token to silence unused warning
+             // Found unexpected tokens after main function definition
+             match self.next_token() {
+                 Ok(unexpected_token_info) => {
+                     return Err(ParseError::UnexpectedToken {
+                         expected: "end of file".to_string(),
+                         found: unexpected_token_info.token,
+                         line: unexpected_token_info.line,
+                         column: unexpected_token_info.column,
+                     });
                  }
+                 Err(e) => return Err(e), // Error consuming the unexpected token
              }
-
-            self.expect(Token::Semicolon)?;
-        }
-
-        Ok(())
+         }
+         Err(e) => return Err(e), // Lexer error during peek
     }
 
-    // Parse type specifiers and pointer declaration
-    fn parse_type_and_identifier(&mut self, mut base_type: DataType) -> Result<(DataType, String), ParserError> {
-        while self.check(&Token::Asterisk) {
-            self.consume()?;
-            base_type = DataType::pointer_to(base_type);
-        }
+    // --- Assemble Final Code ---
+    // The actual entry point address for the CALL instruction is AFTER the preamble.
+    let actual_main_address: Value = PREAMBLE_SIZE as Value;
 
-        if let Token::Ident(name) = self.current_token.clone() {
-            self.consume()?;
-            Ok((base_type, name))
-        } else {
-            Err(ParserError::UnexpectedToken(self.current_token.clone(), "identifier".to_string()))
-        }
+    // Create the preamble vector using the correct address
+    let preamble = vec![
+        Instruction::Call as Value,
+        actual_main_address, // Address where main's code starts (index 3)
+        Instruction::Exit as Value,
+    ];
+
+    // Concatenate preamble and the code generated for main's body
+    // IMPORTANT CAVEAT: If the code in self.code contained any jumps or address calculations
+    // (like JMP, JZ, CALL other_func, LEA with labels), those addresses would be relative
+    // to the start of self.code (offset 0). Prepending the preamble means these internal
+    // addresses would need to be "relocated" (adjusted by PREAMBLE_SIZE).
+    // For hello.c, this is not an issue as it only calls the external printf.
+    let final_code = [preamble, self.code].concat();
+
+    // Return the final code, data, and the *actual* entry point address.
+    // While the preamble handles the initial jump, returning the correct start address
+    // might be useful for debugging or future VM features.
+    Ok((final_code, self.data_segment, actual_main_address))
+}
+
+// Modify parse_global_declaration to ONLY store the relative address (0) for main
+// and NOT set the parser's temporary entry_point field.
+fn parse_global_declaration(&mut self) -> ParseResult<()> {
+    self.expect_token(Token::Int, "type (int)")?;
+    let (name, name_info) = self.expect_identifier("function name")?;
+
+    if name != "main" {
+         return Err(ParseError::Other(format!("Expected 'main' function, found '{}' at {}:{}", name, name_info.line, name_info.column)));
     }
 
-    // Parse an enum declaration
-    fn parse_enum_declaration(&mut self) -> Result<(), ParserError> {
-        self.expect(Token::Enum)?;
-        let enum_name = if let Token::Ident(name) = self.current_token.clone() {
-            self.consume()?;
-            Some(name)
-        } else {
-            None // Allow anonymous enums
-        };
+    self.expect_token(Token::LParen, "'('")?;
+    self.expect_token(Token::RParen, "')'")?;
+    self.expect_token(Token::LBrace, "'{'")?;
 
-        if !self.check(&Token::LBrace) {
-           // Enum forward declaration or usage - C4 doesn't really support this way
-           // Assume definition follows if name is present
-            if enum_name.is_some() && self.check(&Token::Semicolon) {
-                self.consume()?;
-                // Warn or error - C4 doesn't use enum tags like this
-                return Err(ParserError::NotImplemented("Enum forward declaration/tags not fully supported like C4".to_string()));
-            }
-            return Err(ParserError::UnexpectedToken(self.current_token.clone(), "{".to_string()));
-        }
-        self.expect(Token::LBrace)?;
+    // Store the address of main RELATIVE to the start of its code block (always 0 here).
+    // No need to store absolute final address yet.
+    let main_relative_address: i64 = 0;
 
-        let mut current_value: i64 = 0;
-        loop {
-            if self.check(&Token::RBrace) { break; }
+    // Remove: self.entry_point = Some(main_address); // Don't set this here
 
-            let member_name = if let Token::Ident(name) = self.current_token.clone() {
-                self.consume()?;
-                name
-            } else {
-                return Err(ParserError::UnexpectedToken(self.current_token.clone(), "enum member identifier".to_string()));
-            };
-
-            if self.check(&Token::Assign) {
-                self.consume()?;
-                if let Token::Number(val) = self.current_token {
-                    current_value = val;
-                    self.consume()?;
-                } else {
-                    return Err(ParserError::UnexpectedToken(self.current_token.clone(), "number for enum value".to_string()));
-                }
-            }
-
-            // Add enum member to symbol table as a number constant (like C4)
-             self.symbols.add(
-                 member_name.clone(),
-                 Token::Ident(member_name),
-                 SymbolClass::Num,
-                 DataType::Int, // Enums are ints
-                 current_value,
-             ).map_err(|e| ParserError::Redefinition(e))?;
-
-            current_value += 1; // Increment for next default value
-
-            if self.check(&Token::RBrace) { break; }
-            self.expect(Token::Comma)?;
-        }
-        self.expect(Token::RBrace)?;
-        self.expect(Token::Semicolon)?; // Global enums usually end with ;
-
-        Ok(())
-   }
-
-   // Parse a function definition
-   fn parse_function_definition(&mut self, name: String, return_type: DataType) -> Result<(), ParserError> {
-        // Check for redefinition before adding
-        if self.symbols.find(&name).is_some() {
-            // C4 allows forward declarations implicitly, but not redefinitions
-            return Err(ParserError::Redefinition(format!("Symbol '{}' already defined", name)));
-        }
-
-        // Add function symbol *before* parsing body to allow recursion
-        let entry_point = self.next_code_addr();
-        self.symbols.add(
-            name.clone(),
-            Token::Ident(name.clone()),
-            SymbolClass::Fun,
-            return_type.clone(),
-            entry_point as i64,
-        ).map_err(|e| ParserError::Redefinition(e))?;
+     self.symbol_table.add(
+        name.clone(),
+        Token::Ident(name),
+        SymbolClass::Fun,
+        DataType::Int,
+        main_relative_address, // Store relative address 0 for the symbol 'main'
+    ).map_err(|e| ParseError::Other(e))?;
 
 
-        if name == "main" {
-            self.main_entry_point = Some(entry_point);
-        }
+    // --- Function Body ---
+    // Code emitted here starts at index 0 *within self.code*
+    self.emit_with_operand(Instruction::Ent, 0); // Emit main's entry code
 
-        self.expect(Token::LParen)?;
-
-        // Enter function scope
-        self.symbols.enter_scope();
-        let mut param_count = 0;
-        self.local_offset = 0; // Reset local offset (params are positive offsets, locals negative)
-
-        // Parse parameters
-        while !self.check(&Token::RParen) {
-            let param_base_type = match self.current_token {
-                Token::Int => { self.consume()?; DataType::Int },
-                Token::Char => { self.consume()?; DataType::Char },
-                _ => return Err(ParserError::UnexpectedToken(self.current_token.clone(), "parameter type".to_string())),
-            };
-            let (param_type, param_name) = self.parse_type_and_identifier(param_base_type)?;
-
-            self.symbols.add(
-                param_name.clone(),
-                Token::Ident(param_name),
-                SymbolClass::Loc,
-                param_type,
-                param_count + 1, // C4 style: Param 1 is offset 1, Param 2 is offset 2 etc. from frame base
-            ).map_err(|e| ParserError::Redefinition(e))?;
-            param_count += 1;
-
-            if !self.check(&Token::RParen) {
-                self.expect(Token::Comma)?;
-            }
-        }
-        self.expect(Token::RParen)?;
-        self.expect(Token::LBrace)?;
-
-
-        self.local_offset = 0; // Start local allocation index
-        let mut local_var_count = 0;
-
-
-        // Parse local declarations
-        while self.check(&Token::Int) || self.check(&Token::Char) {
-            let base_type = if self.check(&Token::Int) { self.consume()?; DataType::Int } else { self.consume()?; DataType::Char };
-            loop { // Handle multiple declarations per line (int a, *b;)
-                let (var_type, var_name) = self.parse_type_and_identifier(base_type)?;
-                local_var_count += 1;
-                self.local_offset += 1; // Increment index *before* using it
-
-                // Add local variable symbol
-                self.symbols.add(
-                    var_name.clone(),
-                    Token::Ident(var_name),
-                    SymbolClass::Loc,
-                    var_type,
-                    -(self.local_offset as i64), // Locals have negative offsets from BP
-                ).map_err(|e| ParserError::Redefinition(e))?;
-
-                if !self.check(&Token::Comma) { break; }
-                self.consume()?; // Consume comma
-            }
-            self.expect(Token::Semicolon)?;
-        }
-
-        // Emit function entry code
-        self.emit_operand(Instruction::ENT, local_var_count as i64); // ENT takes number of local slots
-
-        // Parse function body (statements)
-        while !self.check(&Token::RBrace) {
-            self.parse_statement()?;
-        }
-        self.expect(Token::RBrace)?;
-
-        // Emit function leave code (implicit return if no explicit LEV emitted)
-        // Check if last emitted instruction was LEV. If not, add one.
-        if self.code.last() != Some(&(Instruction::LEV as i64)) {
-            self.emit(Instruction::LEV);
-        }
-
-        // Leave function scope (restores shadowed symbols)
-        self.symbols.leave_scope();
-
-        Ok(())
-    }
-
-    // Parse a statement
-    fn parse_statement(&mut self) -> Result<(), ParserError> {
-        match self.current_token {
-            Token::If => self.parse_if_statement(),
-            Token::While => self.parse_while_statement(),
-            Token::Return => self.parse_return_statement(),
-            Token::LBrace => self.parse_block_statement(),
-            Token::Semicolon => { // Empty statement
-                self.consume()?;
-                Ok(())
-            }
-            _ => self.parse_expression_statement(), // Default to expression statement
-        }
-    }
-
-    // Parse an if statement
-    fn parse_if_statement(&mut self) -> Result<(), ParserError> {
-        self.expect(Token::If)?;
-        self.expect(Token::LParen)?;
-        self.parse_expression(Precedence::Assign)?; // Parse condition
-        self.expect(Token::RParen)?;
-
-        // Emit Branch if Zero (BZ) - jump if condition is false
-        self.emit(Instruction::BZ);
-        let jump_if_false_addr = self.next_code_addr(); // Address of the operand for BZ
-        self.emit_operand(Instruction::IMM, 0); // Placeholder jump target
-
-        // Parse 'then' block
-        self.parse_statement()?;
-
-        let jump_past_else_addr = if self.check(&Token::Else) {
-             self.consume()?; // Consume 'else'
-
-             // Emit JMP to skip the 'else' block if 'then' block executed
-             self.emit(Instruction::JMP);
-             let addr = self.next_code_addr();
-             self.emit_operand(Instruction::IMM, 0); // Placeholder jump target
-
-             // Patch the BZ instruction to jump here (start of else block)
-             let else_start_addr = self.next_code_addr();
-             self.patch_jump(jump_if_false_addr -1, else_start_addr)?; // BZ instr addr is jump_addr - 1
-
-             // Parse 'else' block
-             self.parse_statement()?;
-             Some(addr) // Return address of the JMP operand past the else
-        } else {
-            None // No else block
-        };
-
-        // Patch jumps
-        let end_if_addr = self.next_code_addr();
-        if let Some(jmp_addr) = jump_past_else_addr {
-             self.patch_jump(jmp_addr - 1, end_if_addr)?; // Patch JMP past else
-        } else {
-             // If no else, patch the initial BZ to jump here
-            self.patch_jump(jump_if_false_addr - 1, end_if_addr)?;
-        }
-
-        Ok(())
-    }
-
-    // Parse a while statement
-    fn parse_while_statement(&mut self) -> Result<(), ParserError> {
-        self.expect(Token::While)?;
-        let loop_start_addr = self.next_code_addr(); // Address to jump back to
-
-        self.expect(Token::LParen)?;
-        self.parse_expression(Precedence::Assign)?; // Parse condition
-        self.expect(Token::RParen)?;
-
-        // Emit Branch if Zero (BZ) - jump out of loop if condition is false
-        self.emit(Instruction::BZ);
-        let jump_out_addr = self.next_code_addr(); // Address of the operand for BZ
-        self.emit_operand(Instruction::IMM, 0); // Placeholder jump target
-
-        // Parse loop body
-        self.parse_statement()?;
-
-        // Emit JMP back to the start of the loop condition
-        self.emit_operand(Instruction::JMP, loop_start_addr as i64);
-
-        // Patch the BZ jump to the instruction after the loop
-        let loop_end_addr = self.next_code_addr();
-        self.patch_jump(jump_out_addr - 1, loop_end_addr)?;
-
-        Ok(())
-    }
-
-    // Parse a return statement
-    fn parse_return_statement(&mut self) -> Result<(), ParserError> {
-        self.expect(Token::Return)?;
-        if !self.check(&Token::Semicolon) {
-            self.parse_expression(Precedence::Assign)?; // Parse return value expression (result in ax)
-            true
-        } else {
-             false
-        };
-        self.expect(Token::Semicolon)?;
-        self.emit(Instruction::LEV); // Emit leave instruction
-        Ok(())
-    }
-
-    // Parse a block statement {...}
-    fn parse_block_statement(&mut self) -> Result<(), ParserError> {
-        self.expect(Token::LBrace)?;
-        // Note: Scoping for locals is handled by function entry/exit.
-        // C block scope for variables is not handled by C4 symbol table logic.
-        // All locals are function-scoped.
-
-        while !self.check(&Token::RBrace) {
-             // C4 doesn't parse declarations inside blocks, only at function top.
-             // So we only expect statements here.
-             if self.check(&Token::Int) || self.check(&Token::Char) || self.check(&Token::Enum){
-                  return Err(ParserError::SyntaxError("Variable declarations are only allowed at the top of a function in C4".to_string()));
-             } else {
+    // Parse statements loop...
+    loop {
+         match self.peek_token()? {
+             Some(Token::RBrace) => {
+                 self.next_token()?; // Consume '}'
+                 break; // End of function body
+             }
+             Some(Token::Eof) | None => {
+                let (line, col) = self.current_pos();
+                let found_token = if self.peek_token()? == Some(&Token::Eof) { Token::Eof } else { Token::Eof };
+                return Err(ParseError::UnexpectedToken {
+                    expected: "'}' or statement".to_string(),
+                    found: found_token,
+                    line,
+                    column: col,
+                });
+             }
+             _ => {
                 self.parse_statement()?;
              }
-        }
-        self.expect(Token::RBrace)?;
-        Ok(())
+         }
     }
+    // ... end of loop ...
 
-    // Parse an expression statement (assignment or function called followed by ;)
-    fn parse_expression_statement(&mut self) -> Result<(), ParserError> {
-        self.parse_expression(Precedence::Assign)?;
-        self.expect(Token::Semicolon)?;
-        Ok(())
-    }
-
-    // Parse an expression using precedence climbing
-    fn parse_expression(&mut self, min_precedence: Precedence) -> Result<DataType, ParserError> {
-        // Parse the left-hand side (primary, unary, or nested expression)
-        let mut left_type = self.parse_unary_or_primary()?;
-
-        // Precedence climbing loop
-        loop {
-            let current_prec = token_precedence(&self.current_token);
-            if current_prec < min_precedence { // Using `<` because higher precedence binds tighter
-                break;
-            }
-
-            // Handle binary operators, postfix operators, conditional
-            let token = self.current_token.clone(); // Clone token for use after consume
-
-             match token {
-                 // --- Assignment ---
-                 Token::Assign => {
-                    // Ensure LHS is an lvalue (requires address)
-                    // Check the last emitted instruction sequence. LI/LC means we have value, not address.
-                    // LEA or IMM (for globals) means we have address.
-                    let last_op = self.code.last().map(|&op| Instruction::from(op));
-                     match last_op {
-                         Some(Instruction::LI) | Some(Instruction::LC) => {
-                             // Convert load to push address
-                             self.code.pop(); // Remove LI/LC
-                             self.emit(Instruction::PSH); // Push address left by LEA/IMM
-                         }
-                         _ => return Err(ParserError::TypeError("Lvalue required for assignment".to_string())),
-                     }
-
-                    self.consume()?; // Consume '='
-                    let right_type = self.parse_expression(Precedence::Assign)?; // Right associative for assign
-
-                    // Emit store instruction based on LHS type
-                    match left_type {
-                        DataType::Char => self.emit(Instruction::SC),
-                        DataType::Int | DataType::Ptr(_) => self.emit(Instruction::SI),
-                        DataType::Void => return Err(ParserError::TypeError("Cannot assign to void".to_string())),
-                    }
-                    // Assignment result is the assigned value (already in ax from right expr)
-                    // Type remains the type of the LHS
-                 }
-
-                 // --- Arithmetic / Bitwise / Logical ---
-                 Token::Add => { self.emit(Instruction::PSH); self.consume()?; let right = self.parse_expression(Precedence::Add)?; self.emit_binary_op(Instruction::ADD, left_type, right)?; left_type = DataType::Int; } // Pointer arith handled in emit
-                 Token::Sub => { self.emit(Instruction::PSH); self.consume()?; let right = self.parse_expression(Precedence::Add)?; self.emit_binary_op(Instruction::SUB, left_type, right)?; left_type = DataType::Int; } // Pointer arith handled in emit
-                 Token::Mul => { self.emit(Instruction::PSH); self.consume()?; self.parse_expression(Precedence::Mul)?; self.emit(Instruction::MUL); left_type = DataType::Int; }
-                 Token::Div => { self.emit(Instruction::PSH); self.consume()?; self.parse_expression(Precedence::Mul)?; self.emit(Instruction::DIV); left_type = DataType::Int; }
-                 Token::Mod => { self.emit(Instruction::PSH); self.consume()?; self.parse_expression(Precedence::Mul)?; self.emit(Instruction::MOD); left_type = DataType::Int; }
-                 Token::BitOr => { self.emit(Instruction::PSH); self.consume()?; self.parse_expression(Precedence::BitOr)?; self.emit(Instruction::OR); left_type = DataType::Int; }
-                 Token::BitXor=> { self.emit(Instruction::PSH); self.consume()?; self.parse_expression(Precedence::BitXor)?; self.emit(Instruction::XOR); left_type = DataType::Int; }
-                 Token::Ampersand | Token::BitAnd => { self.emit(Instruction::PSH); self.consume()?; self.parse_expression(Precedence::BitAnd)?; self.emit(Instruction::AND); left_type = DataType::Int; }
-                 Token::Eq => { self.emit(Instruction::PSH); self.consume()?; self.parse_expression(Precedence::Eq)?; self.emit(Instruction::EQ); left_type = DataType::Int; }
-                 Token::Ne => { self.emit(Instruction::PSH); self.consume()?; self.parse_expression(Precedence::Eq)?; self.emit(Instruction::NE); left_type = DataType::Int; }
-                 Token::Lt => { self.emit(Instruction::PSH); self.consume()?; self.parse_expression(Precedence::Lt)?; self.emit(Instruction::LT); left_type = DataType::Int; }
-                 Token::Gt => { self.emit(Instruction::PSH); self.consume()?; self.parse_expression(Precedence::Lt)?; self.emit(Instruction::GT); left_type = DataType::Int; }
-                 Token::Le => { self.emit(Instruction::PSH); self.consume()?; self.parse_expression(Precedence::Lt)?; self.emit(Instruction::LE); left_type = DataType::Int; }
-                 Token::Ge => { self.emit(Instruction::PSH); self.consume()?; self.parse_expression(Precedence::Lt)?; self.emit(Instruction::GE); left_type = DataType::Int; }
-                 Token::Shl => { self.emit(Instruction::PSH); self.consume()?; self.parse_expression(Precedence::Shl)?; self.emit(Instruction::SHL); left_type = DataType::Int; }
-                 Token::Shr => { self.emit(Instruction::PSH); self.consume()?; self.parse_expression(Precedence::Shl)?; self.emit(Instruction::SHR); left_type = DataType::Int; }
-
-                 // --- Logical (Short-circuiting) ---
-                 Token::LogOr => { // a || b --> if a is true (non-zero), result is 1, else eval b
-                     self.emit(Instruction::BNZ); // Branch if non-zero (true)
-                     let jump_if_true_addr = self.next_code_addr();
-                     self.emit_operand(Instruction::IMM, 0); // Placeholder
-                     self.consume()?;
-                     self.parse_expression(Precedence::LogAnd)?; // Evaluate right side only if needed
-                     let end_addr = self.next_code_addr();
-                     self.patch_jump(jump_if_true_addr - 1, end_addr)?;
-                     // If we got here, left was false, result is bool of right side (ax!=0)
-                     // C4 doesn't explicitly boolify, result is ax. Let's keep ax.
-                     left_type = DataType::Int;
-                 }
-                 Token::LogAnd => { // a && b --> if a is false (zero), result is 0, else eval b
-                     self.emit(Instruction::BZ); // Branch if zero (false)
-                     let jump_if_false_addr = self.next_code_addr();
-                     self.emit_operand(Instruction::IMM, 0); // Placeholder
-                     self.consume()?;
-                     self.parse_expression(Precedence::BitOr)?; // Evaluate right side only if needed
-                     let end_addr = self.next_code_addr();
-                     self.patch_jump(jump_if_false_addr - 1, end_addr)?;
-                     // If we got here, left was true, result is bool of right side (ax!=0)
-                     // C4 doesn't explicitly boolify, result is ax. Let's keep ax.
-                     left_type = DataType::Int;
-                 }
-
-                 // --- Postfix Operators ---
-                 Token::LBracket => { // Array indexing: ptr[index]
-                    let ptr_type = left_type;
-                     if ptr_type.pointer_level() == 0 {
-                        return Err(ParserError::TypeError("Attempting to index a non-pointer type".to_string()));
-                     }
-                    self.emit(Instruction::PSH); // Push pointer value
-                    self.consume()?; // Consume '['
-                    let index_type = self.parse_expression(Precedence::Assign)?; // Parse index expression
-                    self.expect(Token::RBracket)?; // Consume ']'
-
-                    // Emit pointer arithmetic: addr = base_ptr + index * sizeof(*base_ptr)
-                    let element_type = ptr_type.deref().unwrap(); // We checked it's a pointer
-                    if element_type.size_of() > 1 {
-                        self.emit_operand(Instruction::IMM, element_type.size_of());
-                        self.emit(Instruction::MUL); // index *= sizeof(element)
-                    }
-                    self.emit(Instruction::ADD); // base_ptr + scaled_index
-
-                    // Emit load instruction (result is an rvalue)
-                    match element_type {
-                        DataType::Char => self.emit(Instruction::LC),
-                        DataType::Int | DataType::Ptr(_) => self.emit(Instruction::LI),
-                        DataType::Void => return Err(ParserError::TypeError("Cannot index void pointer".to_string())),
-                    }
-                    left_type = element_type; // Type is the type of the element
-                 }
-                 Token::Inc | Token::Dec => { // Postfix ++ / --
-                     // Requires lvalue
-                     let last_op = self.code.last().map(|&op| Instruction::from(op));
-                      match last_op {
-                          Some(Instruction::LI) | Some(Instruction::LC) => {
-                             // 1. Save original address (it's below LI/LC)
-                             // Code: ..., LEA/IMM offset, LI/LC
-                             // We need to push the address again for the store.
-                             self.code.pop(); // Remove LI/LC
-                             // Stack has original value loaded by LI/LC
-                             // ax has original value
-                             // We need: PSH addr, PSH original_val
-                             // C4: if (*e == LC) { *e = PSH; *++e = LC; }
-                             self.emit(Instruction::PSH); // Push address
-                             match last_op {
-                                 Some(Instruction::LC) => self.emit(Instruction::LC),
-                                 _ => self.emit(Instruction::LI),
-                             }
-                             // Now stack: [..., address, original_value]
-                          }
-                          _ => return Err(ParserError::TypeError("Lvalue required for postfix ++/--".to_string())),
-                      }
-
-                      self.emit(Instruction::PSH); // Push address again (for store)
-                      self.emit_operand(Instruction::IMM, left_type.deref().unwrap_or(DataType::Char).size_of()); // Sizeof element
-                      if token == Token::Inc { self.emit(Instruction::ADD); } else { self.emit(Instruction::SUB); }
-
-                      // Store incremented/decremented value
-                      match left_type {
-                           DataType::Char => self.emit(Instruction::SC),
-                           DataType::Int | DataType::Ptr(_) => self.emit(Instruction::SI),
-                           _ => panic!("Should be lvalue"),
-                       }
-                       // Result of postfix is the *original* value. We need to subtract the increment back.
-                       self.emit(Instruction::PSH); // Push address (still on stack?) No, need to get it again? C4 pushes value.
-                       // C4 logic: Push value, Push IMM size, ADD/SUB, SC/SI, Push IMM size, SUB/ADD
-                       // Let's rethink. Stack after load: [..., address]. ax = value.
-                       // We need ax to hold original value at the end.
-                       // 1. PSH ax (original value)
-                       self.emit(Instruction::PSH);
-                       // 2. Calculate new value: ax = ax + size
-                       self.emit_operand(Instruction::IMM, left_type.deref().unwrap_or(DataType::Char).size_of());
-                       if token == Token::Inc { self.emit(Instruction::ADD); } else { self.emit(Instruction::SUB); }
-                       // 3. Store new value: PSH addr, ax=new_val, SI/SC
-                       // We need the address again. Assume it's below the original value pushed in step 1.
-                       // Need to swap stack[top] (original val) and stack[top-1] (address)? Complex.
-
-                       // Let's try C4's emit sequence more directly:
-                       // Assume code ends with LEA/IMM addr, LI/LC. ax=value.
-                       // C4: if (*e == LC) { *e = PSH; *++e = LC; } else { *e=PSH; *++e=LI; }
-                       // This pushes the address, then re-loads the value into ax.
-                       let last_op_val = self.code.pop().unwrap(); // LI or LC
-                       self.emit(Instruction::PSH); // Push address
-                       self.code.push(last_op_val); // Put LI/LC back
-                       // Stack: [..., address], ax = value
-
-                       // C4: *++e = PSH;
-                       self.emit(Instruction::PSH); // Push value ax
-                       // Stack: [..., address, value]
-
-                       // C4: *++e = IMM; *++e = size;
-                       self.emit_operand(Instruction::IMM, left_type.deref().unwrap_or(DataType::Char).size_of());
-                       // Stack: [..., address, value, size]
-
-                       // C4: *++e = (tk == Inc) ? ADD : SUB;
-                       let op = if token == Token::Inc { Instruction::ADD } else { Instruction::SUB };
-                       self.emit(op); // ax = value + size
-                       // Stack: [..., address]
-
-                       // C4: *++e = (ty == CHAR) ? SC : SI;
-                       let store_op = match left_type {
-                            DataType::Char => Instruction::SC,
-                            _ => Instruction::SI,
-                       };
-                       self.emit(store_op); // stack[address] = ax (new value). Pops address.
-                       // Stack: [...]
-
-                       // C4: *++e = PSH; *++e = IMM; *++e = size;
-                       self.emit(Instruction::PSH); // Push new value (still in ax) - NO, C4 pushes size!
-                       self.emit_operand(Instruction::IMM, left_type.deref().unwrap_or(DataType::Char).size_of());
-                       // Stack: [..., size]
-
-                       // C4: *++e = (tk == Inc) ? SUB : ADD;
-                       let op = if token == Token::Inc { Instruction::SUB } else { Instruction::ADD };
-                       self.emit(op); // ax = ax - size (restore original value)
-                       // Stack: [...]
-
-                       self.consume()?; // Consume ++ / --
-                       // Type doesn't change, value in ax is original value
-                 }
-
-                // --- Function Call ---
-                 Token::LParen => { // Function call
-                     let sym_entry = self.find_symbol_for_expression()?; // Get symbol for the function name expression
-                     if sym_entry.class != SymbolClass::Fun && sym_entry.class != SymbolClass::Sys {
-                        return Err(ParserError::TypeError(format!("'{}' is not a function", sym_entry.name)));
-                     }
-                     let func_type = sym_entry.data_type.clone(); // Should be function type if we had them
-                     let func_class = sym_entry.class;
-                     let func_val = sym_entry.value; // Address or syscall number
-
-                     self.consume()?; // Consume '('
-                     let mut arg_count = 0;
-                     while !self.check(&Token::RParen) {
-                         self.parse_expression(Precedence::Assign)?; // Parse argument expression
-                         self.emit(Instruction::PSH); // Push argument onto stack
-                         arg_count += 1;
-                         if !self.check(&Token::RParen) {
-                             self.expect(Token::Comma)?;
-                         }
-                     }
-                     self.expect(Token::RParen)?; // Consume ')'
-
-                     // Emit call instruction
-                     match func_class {
-                        SymbolClass::Sys => {
-                            // C4 emits the specific syscall opcode. func_val holds this opcode value.
-                            // Instruction::from converts the *integer value* back to the *enum variant*.
-                            self.emit(Instruction::from(func_val)); // Convert opcode value to enum
-                            ;
-                        }
-                        SymbolClass::Fun => {
-                            // func_val holds the entry address for JSR
-                            self.emit_operand(Instruction::JSR, func_val);
-                        }
-                        _ => unreachable!(),
-                    }
-
-                     // Adjust stack pointer to remove arguments
-                     if arg_count > 0 {
-                         self.emit_operand(Instruction::ADJ, arg_count);
-                     }
-
-                     // Result type is function's return type
-                     left_type = func_type;
-                 }
-
-                 _ => return Err(ParserError::InternalError(format!("Unhandled binary/postfix token: {:?}", token))),
-             } // end match token
-
-        } // end loop
-
-        Ok(left_type)
-    }
-
-    // Parse primary expressions (literals, identifiers, and parenthesized expressions) and unary operations
-    fn parse_unary_or_primary(&mut self) -> Result<DataType, ParserError> {
-        let token = self.current_token.clone();
-
-        match token {
-            // --- Literals ---
-            Token::Number(val) => {
-                self.consume()?;
-                self.emit_operand(Instruction::IMM, val);
-                Ok(DataType::Int)
-            }
-             Token::CharLiteral(val) => {
-                 self.consume()?;
-                 self.emit_operand(Instruction::IMM, val as i64); // Promote char to int
-                 Ok(DataType::Char) // Type is char, though value is int
-             }
-             Token::StringLiteral(val) => {
-                 self.consume()?;
-                 // Store string in data segment, get address
-                  let addr = self.add_global_data(val.as_bytes());
-                  self.add_global_data(&[0]); // Null terminate
-                  self.emit_operand(Instruction::IMM, addr as i64); // Emit address as immediate
-                  Ok(DataType::pointer_to(DataType::Char)) // Type is char*
-             }
-
-            // --- Sizeof ---
-            Token::Sizeof => {
-                self.consume()?;
-                self.expect(Token::LParen)?;
-                // Parse type name inside sizeof
-                 let base_type = match self.current_token {
-                     Token::Int => { self.consume()?; DataType::Int },
-                     Token::Char => { self.consume()?; DataType::Char },
-                     _ => return Err(ParserError::UnexpectedToken(self.current_token.clone(), "type name (int/char)".to_string())),
-                 };
-                 let mut target_type = base_type;
-                 while self.check(&Token::Asterisk) {
-                     self.consume()?;
-                     target_type = DataType::pointer_to(target_type);
-                 }
-                self.expect(Token::RParen)?;
-
-                self.emit_operand(Instruction::IMM, target_type.size_of());
-                Ok(DataType::Int) // Result of sizeof is int
-            }
-
-            // --- Parenthesized Expression ---
-            Token::LParen => {
-                self.consume()?;
-                 // Check for type cast: (type) expr
-                 let is_cast = match self.current_token {
-                     Token::Int | Token::Char => true,
-                     _ => false,
-                 };
-
-                 if is_cast {
-                     let base_type = if self.check(&Token::Int) { self.consume()?; DataType::Int } else { self.consume()?; DataType::Char };
-                     let mut cast_target_type = base_type;
-                      while self.check(&Token::Asterisk) {
-                          self.consume()?;
-                          cast_target_type = DataType::pointer_to(cast_target_type);
-                      }
-                      self.expect(Token::RParen)?;
-                      // Parse the expression being casted
-                      let _original_type = self.parse_expression(Precedence::Unary)?; // Cast has high precedence
-                      Ok(cast_target_type)
-
-                 } else {
-                      // Regular parenthesized expression
-                     let expr_type = self.parse_expression(Precedence::Assign)?; // Start precedence low inside parens
-                     self.expect(Token::RParen)?;
-                     Ok(expr_type) // Type is the type of the inner expression
-                 }
-            }
-
-            // --- Identifiers (Variables, Enum constants, Functions) ---
-            Token::Ident(name) => {
-                self.consume()?;
-                match self.symbols.find(&name) {
-                    Some(entry) => {
-                        let sym_type = entry.data_type.clone();
-                        match entry.class {
-                            SymbolClass::Num => { // Enum constant
-                                self.emit_operand(Instruction::IMM, entry.value);
-                                Ok(DataType::Int)
-                            }
-                            SymbolClass::Loc => { // Local variable
-                                // Emit LEA (Load Effective Address) using offset from BP
-                                self.emit_operand(Instruction::LEA, entry.value); // Value is offset
-                                // Emit load instruction (LI/LC) to get the value
-                                match sym_type {
-                                    DataType::Char => self.emit(Instruction::LC),
-                                    DataType::Int | DataType::Ptr(_) => self.emit(Instruction::LI),
-                                    DataType::Void => return Err(ParserError::TypeError("Cannot use void variable".to_string())),
-                                }
-                                Ok(sym_type)
-                            }
-                            SymbolClass::Glo => { // Global variable
-                                 // Emit IMM (Immediate) with the address in the data segment
-                                self.emit_operand(Instruction::IMM, entry.value); // Value is data address
-                                // Emit load instruction (LI/LC) to get the value
-                                match sym_type {
-                                    DataType::Char => self.emit(Instruction::LC),
-                                    DataType::Int | DataType::Ptr(_) => self.emit(Instruction::LI),
-                                    DataType::Void => return Err(ParserError::TypeError("Cannot use void variable".to_string())),
-                                }
-                                Ok(sym_type)
-                            }
-                            SymbolClass::Fun | SymbolClass::Sys => {
-                                // Function name used as value (address) - Not typical in C4 exprs unless taking addr-of
-                                // For now, treat this as an error if not followed by '(' (handled in parse_expression loop)
-                                // If & operator is used, parse_unary handles it.
-                                Err(ParserError::SyntaxError(format!("Unexpected use of function name '{}' as a value", name)))
-                            }
-                             SymbolClass::Enum => Err(ParserError::SyntaxError(format!("Cannot use enum tag '{}' as a value", name))),
-                        }
-                    }
-                    None => Err(ParserError::UndefinedSymbol(name)),
-                }
-            }
-
-            // --- Unary Operators ---
-             Token::Asterisk => { // Dereference '*'
-                 self.consume()?;
-                 let ptr_type = self.parse_expression(Precedence::Unary)?; // Parse operand
-                 match ptr_type.deref() {
-                    Some(target_type) => {
-                        // Emit load instruction LI/LC based on target type
-                        match target_type {
-                            DataType::Char => self.emit(Instruction::LC),
-                            DataType::Int | DataType::Ptr(_) => self.emit(Instruction::LI),
-                            DataType::Void => return Err(ParserError::TypeError("Cannot dereference void pointer".to_string())),
-                        }
-                        Ok(target_type) // Result type is the pointed-to type
-                    }
-                    None => Err(ParserError::TypeError("Cannot dereference non-pointer type".to_string())),
-                 }
-             }
-            Token::Ampersand => { // Address-of '&'
-                self.consume()?;
-                 // The operand must be an lvalue (variable).
-                 // We need to parse the operand *without* the final LI/LC.
-                 // Let's parse it normally and then remove the load instruction.
-                 let lvalue_type = self.parse_expression(Precedence::Unary)?;
-                 let last_op = self.code.last().map(|&op| Instruction::from(op));
-                  match last_op {
-                      Some(Instruction::LI) | Some(Instruction::LC) => {
-                          self.code.pop(); // Remove the load, leave the address in ax
-                          Ok(DataType::pointer_to(lvalue_type)) // Result type is pointer to operand type
-                      }
-                      _ => Err(ParserError::TypeError("Cannot take address of non-lvalue".to_string())),
-                  }
-            }
-            Token::Not => { // Logical NOT '!'
-                self.consume()?;
-                self.parse_expression(Precedence::Unary)?;
-                // C4: PSH, IMM 0, EQ -> Check if ax == 0
-                self.emit(Instruction::PSH); // Push ax
-                self.emit_operand(Instruction::IMM, 0);
-                self.emit(Instruction::EQ); // ax = (ax == 0)
-                Ok(DataType::Int)
-            }
-            Token::Sub => { // Unary minus '-'
-                self.consume()?;
-                 // Check if next is number literal for optimization
-                 if let Token::Number(val) = self.current_token {
-                     self.consume()?;
-                     self.emit_operand(Instruction::IMM, -val);
-                 } else {
-                     self.parse_expression(Precedence::Unary)?;
-                     // C4: IMM -1, PSH, MUL --> Multiply by -1
-                      // Let's optimize: PSH 0, SUB -> 0 - ax
-                      self.emit(Instruction::PSH);
-                      self.emit_operand(Instruction::IMM, 0);
-                      self.emit(Instruction::SUB); // ax = 0 - ax
-                 }
-                Ok(DataType::Int)
-            }
-            Token::Add => { // Unary plus '+' (No-op)
-                 self.consume()?;
-                 self.parse_expression(Precedence::Unary)?;
-                 Ok(DataType::Int) // Type doesn't change, no code emitted
-            }
-             Token::Inc | Token::Dec => { // Prefix ++ / --
-                 let op_token = token;
-                 self.consume()?;
-                 // Operand must be lvalue
-                 let target_type = self.parse_expression(Precedence::Unary)?;
-                 // Check last instruction was load, remove it
-                 let last_op = self.code.last().map(|&op| Instruction::from(op));
-                  let addr_in_ax = match last_op {
-                      Some(Instruction::LI) | Some(Instruction::LC) => {
-                          self.code.pop(); // Remove load, address is in ax
-                          true
-                      }
-                      _ => return Err(ParserError::TypeError("Lvalue required for prefix ++/--".to_string())),
-                  };
-
-                 // 1. Push address (currently in ax)
-                 self.emit(Instruction::PSH);
-                 // 2. Reload value: LI/LC
-                  match target_type {
-                      DataType::Char => self.emit(Instruction::LC),
-                      DataType::Int | DataType::Ptr(_) => self.emit(Instruction::LI),
-                      _ => panic!("Should be lvalue type"),
-                  }
-                 // 3. Increment/decrement ax
-                 self.emit(Instruction::PSH); // Push value
-                 self.emit_operand(Instruction::IMM, target_type.deref().unwrap_or(DataType::Char).size_of());
-                 let op = if op_token == Token::Inc { Instruction::ADD } else { Instruction::SUB };
-                 self.emit(op); // ax = value +/- size
-                 // 4. Store back: SC/SI
-                  let store_op = match target_type {
-                      DataType::Char => Instruction::SC,
-                      _ => Instruction::SI,
-                  };
-                 self.emit(store_op); // Pops address, stores ax
-
-                 // Result is the *new* value (already in ax)
-                 Ok(target_type)
-             }
-            _ => Err(ParserError::UnexpectedToken(token, "expression".to_string())),
-        }
-    }
-
-    // Helper to find symbol associated with the start of the current expression part.
-    // Used for function calls where the name might be complex (e.g., `ptr->func()`).
-    // Simplified: Assumes the function name is a direct identifier for now.
-    fn find_symbol_for_expression(&self) -> Result<SymbolEntry, ParserError> {
-    // Handle `Id (` specially at start of `parse_unary_or_primary` ---
-    // This seems the most direct translation of C4's logic.
-    if let Token::Ident(name) = &self.current_token {
-            if let Some(entry) = self.symbols.find(name) {
-                if entry.class == SymbolClass::Fun || entry.class == SymbolClass::Sys {
-                    // Peek ahead to see if it's a function call
-                    if self.peek()? == &Token::LParen {
-                        // Return a dummy type, the call logic in parse_expression will handle it
-                        // We need to pass the symbol info though...
-                        // Maybe return Result< (DataType, Option<SymbolEntry>) > ?
-                        // Let's just return the symbol entry directly for now.
-                        return Ok(entry.clone()); // Clone needed as find returns ref
-                    }
-                }
-            }
-    }
-        // C4's `d=id; next(); if (tk == '(')` is simpler. Let's refactor `parse_expression` start.
-
-        Err(ParserError::InternalError("Cannot reliably find function symbol in current structure".to_string()))
-}
-
- // --- Helper for Binary Ops (Pointer Arithmetic) ---
- fn emit_binary_op(&mut self, op: Instruction, left: DataType, right: DataType) -> Result<(), ParserError> {
-    match op {
-        Instruction::ADD => {
-            // ptr + int | int + ptr
-            if left.pointer_level() > 0 && right == DataType::Int {
-                // left is ptr, right is int. Scale right by sizeof(*left)
-                self.emit_operand(Instruction::IMM, left.deref().unwrap().size_of());
-                self.emit(Instruction::MUL); // ax = right * scale
-            } else if left == DataType::Int && right.pointer_level() > 0 {
-                // left is int, right is ptr. Swap operands before scaling.
-                // Need VM instruction SWAP or simulate with stack ops (PSH, LI from stack, PSH other, LI) - complex.
-                // Let's assume VM handles ptr+int symmetrically for now, or require ptr on left.
-                 return Err(ParserError::NotImplemented("int + ptr needs operand swap or VM support".to_string()));
-                // Alternative: emit PSH left_val, load right_ptr, PSH right_ptr, load left_val (from stack)
-                // then scale left_val, then ADD.
-            } else if left.pointer_level() > 0 && right.pointer_level() > 0 {
-                return Err(ParserError::TypeError("Cannot add two pointers".to_string()));
-            }
-            // If both ints, or other cases, just add.
-            self.emit(Instruction::ADD);
-        }
-        Instruction::SUB => {
-            // ptr - int
-            if left.pointer_level() > 0 && right == DataType::Int {
-                // left is ptr, right is int. Scale right by sizeof(*left)
-                self.emit_operand(Instruction::IMM, left.deref().unwrap().size_of());
-                self.emit(Instruction::MUL); // ax = right * scale
-                self.emit(Instruction::SUB); // result = left_ptr - scaled_right
-            }
-            // ptr - ptr
-            else if left.pointer_level() > 0 && right.pointer_level() > 0 {
-                 if left != right { // Ensure pointers are compatible (same base type) - simple check
-                     return Err(ParserError::TypeError("Subtracting incompatible pointer types".to_string()));
-                 }
-                 self.emit(Instruction::SUB); // result = ptr1_addr - ptr2_addr (byte difference)
-                 // Divide by element size to get element difference
-                 self.emit(Instruction::PSH); // Push byte difference
-                 self.emit_operand(Instruction::IMM, left.deref().unwrap().size_of());
-                 self.emit(Instruction::DIV); // result = byte_diff / sizeof(element)
-            }
-            // int - ptr (invalid)
-            else if left == DataType::Int && right.pointer_level() > 0 {
-                 return Err(ParserError::TypeError("Cannot subtract pointer from integer".to_string()));
-            }
-            // int - int
-            else {
-                self.emit(Instruction::SUB);
-            }
-        }
-         // Default for other ops (no pointer specific logic needed for *, /, %, etc.)
-        _ => self.emit(op),
-    }
-     Ok(())
+    Ok(())
 }
 
 
+    /// Parses a single statement.
+    fn parse_statement(&mut self) -> ParseResult<()> {
+        // Peek first to decide what kind of statement it is
+        match self.peek_token()? {
+            Some(Token::Return) => {
+                self.next_token()?; // Consume 'return'
+                self.parse_expression()?; // Evaluate expression, result ends up in AX
+                self.emit(Instruction::Lev); // Leave function (restores BP, pops PC)
+                self.expect_token(Token::Semicolon, "';'")?;
+            }
+            Some(Token::Eof) | None => return Err(ParseError::EndOfInput), // Unexpected EOF
+            // Handle other statements here if needed (e.g., if, while, '{' for block)
+            _ => {
+                // Assume expression statement (like a function call)
+                self.parse_expression()?;
+                 // Result of expression statement is often discarded.
+                 // In C, the value remains (e.g., in AX), but isn't used unless assigned.
+                 // For printf("hello"), the return value of printf stays in AX.
+                 // C4 VM doesn't seem to have explicit POP/discard.
+                self.expect_token(Token::Semicolon, "';'")?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Parses an expression (highly simplified).
+    fn parse_expression(&mut self) -> ParseResult<()> {
+        // Only handles: Number literal, String literal, Function call (printf)
+         let token_info = self.next_token()?;
+         match token_info.token {
+             Token::Number(val) => {
+                 // Check if number fits in i32
+                 if val < i32::MIN as i64 || val > i32::MAX as i64 {
+                     return Err(ParseError::Other(format!("Integer literal {} out of i32 range at {}:{}", val, token_info.line, token_info.column)));
+                 }
+                 self.emit_with_operand(Instruction::Imm, val as Value); // Load number into AX
+             }
+             Token::StringLiteral(s) => {
+                 let addr = self.add_string_literal(&s);
+                 self.emit_with_operand(Instruction::Imm, addr); // Load string address (Value/i32) into AX
+             }
+             Token::Ident(name) => {
+                // Look ahead to see if it's a function call
+                 if self.peek_token()? == Some(&Token::LParen) {
+                     self.next_token()?; // Consume '('
+                     self.parse_function_call(name, token_info.line, token_info.column)?;
+                 } else {
+                     // Variable access - not supported yet in this minimal parser
+                     // Need symbol table lookup here for variables eventually.
+                     return Err(ParseError::Other(format!("Variable access for '{}' not implemented at {}:{}", name, token_info.line, token_info.column)));
+                 }
+             }
+             Token::Eof => return Err(ParseError::EndOfInput), // Unexpected EOF
+            _ => {
+                 return Err(ParseError::UnexpectedToken {
+                     expected: "expression (number, string, or function call)".to_string(),
+                     found: token_info.token,
+                     line: token_info.line,
+                     column: token_info.column,
+                 });
+             }
+         }
+         Ok(())
+    }
+
+     /// Parses a function call like `name(...)`
+    fn parse_function_call(&mut self, name: String, line: usize, column: usize) -> ParseResult<()> {
+        // Find function in symbol table
+        let func_entry = self.symbol_table.find(&name).cloned() // Clone to avoid borrow issues
+            .ok_or_else(|| ParseError::UndefinedSymbol(name.clone(), line, column))?;
+
+        // Ensure it's a callable symbol (Function or System call)
+        let func_addr_i64 = match func_entry.class { // Address from symbol table is i64
+            SymbolClass::Fun | SymbolClass::Sys => func_entry.value,
+            _ => return Err(ParseError::NotAFunction(name, line, column)),
+        };
+
+        let mut arg_count = 0;
+        // Parse arguments (pushing them onto stack)
+        if self.peek_token()? != Some(&Token::RParen) {
+             loop {
+                 self.parse_expression()?; // Evaluate argument expression (result in AX)
+                 self.emit(Instruction::Push); // Push argument (AX) onto stack
+                 arg_count += 1;
+
+                 // Check for comma or closing paren
+                 match self.peek_token()? {
+                    Some(Token::Comma) => {
+                        self.next_token()?; // Consume ','
+                        // Continue loop for next argument
+                    }
+                    Some(Token::RParen) => {
+                        break; // End of arguments
+                    }
+                    Some(Token::Eof) | None => return Err(ParseError::EndOfInput),
+                    Some(other) => return Err(ParseError::UnexpectedToken {
+                        expected: "',' or ')'".to_string(),
+                        found: other.clone(),
+                        // Get position from peeked token
+                        line: self.tokens.peek().unwrap().as_ref().ok().map_or(line, |ti| ti.line),
+                        column: self.tokens.peek().unwrap().as_ref().ok().map_or(column, |ti| ti.column),
+                    }),
+                 }
+             }
+         }
+
+        // We must find the closing parenthesis now
+        self.expect_token(Token::RParen, "')'")?;
+
+         // Check if the address fits in Value (i32) before casting
+         // (except for the special -1 case)
+         if func_addr_i64 != -1 && (func_addr_i64 < i32::MIN as i64 || func_addr_i64 > i32::MAX as i64) {
+             return Err(ParseError::Other(format!("Function address {} for '{}' out of i32 range", func_addr_i64, name)));
+         }
+         let func_addr_val = func_addr_i64 as Value; // Cast i64 address to Value (i32)
+
+        // Emit call instruction (using the Value/i32 address)
+        self.emit_with_operand(Instruction::Call, func_addr_val);
+
+
+        // Clean up arguments from stack if caller cleans (C convention)
+        if arg_count > 0 {
+             // FIX: Cast arg_count (usize) to Value (i32)
+             if arg_count > i32::MAX as usize {
+                return Err(ParseError::Other(format!("Argument count {} exceeds i32::MAX", arg_count)));
+             }
+             self.emit_with_operand(Instruction::Adj, arg_count as Value);
+        }
+
+        // Result of function call is now in AX (e.g., return value of printf)
+
+        Ok(())
+    }
 }

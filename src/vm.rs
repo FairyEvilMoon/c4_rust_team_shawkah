@@ -97,21 +97,22 @@ impl std::error::Error for VmError {}
 #[derive(Debug)]
 pub struct VirtualMachine {
     // Registers
-    pc: usize,          // Program Counter (index into `code`)
-    sp: usize,          // Stack Pointer (index into `memory`, points *to top item*, grows down)
-    bp: usize,          // Base Pointer (index into `memory`)
-    ax: Value,          // Accumulator Register
+    pc: usize,
+    pub sp: usize, // <-- Make pub
+    bp: usize,
+    ax: Value,
 
     // Memory
     code: Vec<Value>,
-    memory: Vec<Value>, // Combined stack and (potentially) heap memory (using Value for word-addressing)
-    data_segment: Vec<u8>, // Read-only data segment (byte-addressed)
+    memory: Vec<Value>,
+    data_segment: Vec<u8>,
 
     // State
     running: bool,
     code_size: usize,
-    memory_size: usize, // Total size of `memory` in Value words
+    pub memory_size: usize, // <-- Make pub
 }
+
 
 impl VirtualMachine {
     /// Creates a new VM with code, data segment, and default memory size.

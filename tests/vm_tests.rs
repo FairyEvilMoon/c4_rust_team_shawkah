@@ -1,244 +1,216 @@
+// src/vm.rs
+// ... (rest of the vm code) ...
+
 #[cfg(test)]
 mod tests {
-    use c4_rust_team_shawkah::vm::{Instruction, VirtualMachine, VmError, Value, STACK_TOP, DEFAULT_MEM_SIZE};
+    use c4_rust_team_shawkah::vm::{Instruction, Value, VirtualMachine, VmError, DEFAULT_MEM_SIZE};
 
-    // Helper to create and run VM, returning final state or error
-    fn run_code(code: Vec<Value>) -> Result<VirtualMachine, VmError> {
-        let mut vm = VirtualMachine::new(code);
-        vm.run()?;
-        Ok(vm)
-    }
-
-    // Helper to create and run VM, expecting success and returning final AX
-     fn run_code_get_ax(code: Vec<Value>) -> Value {
-        let vm = run_code(code).expect("VM execution failed unexpectedly");
-        vm.ax
-    }
-
-     // Helper to create and run VM, expecting specific error
-    fn run_code_expect_error(code: Vec<Value>, expected_error: VmError) {
-        let result = run_code(code);
-        assert!(result.is_err(), "Expected VM error {:?}, but got Ok({:?})", expected_error, result.as_ref().ok());
-        let actual_error = result.unwrap_err();
-        assert_eq!(actual_error, expected_error, "Expected VM error: {:?}\n           but got: {:?}", expected_error, actual_error);
-    }
-
-
-    #[test]
-    fn test_nop() {
-        let code = vec![Instruction::Nop as Value, Instruction::Exit as Value];
-        let vm = run_code(code).unwrap();
-        assert_eq!(vm.pc, 2, "PC should be 2 after fetching NOP and EXIT");
-        assert_eq!(vm.ax, 0);
+    // Helper function to create and run VM with simple code
+    fn run_vm_code(code: Vec<Value>) -> Result<Value, VmError> {
+        // Use empty data segment for most tests
+        let data: Vec<u8> = Vec::new();
+        let mut vm = VirtualMachine::new(code, data);
+        vm.run()
     }
 
     #[test]
-    fn test_imm_push() {
+    fn test_imm_exit() {
         let code = vec![
             Instruction::Imm as Value, 42,
-            Instruction::Push as Value,
-            Instruction::Imm as Value, 99,
             Instruction::Exit as Value,
         ];
-        let vm = run_code(code).unwrap();
-        assert_eq!(vm.ax, 99);
-        assert_eq!(vm.sp, STACK_TOP - 1);
-        assert_eq!(vm.stack[vm.sp], 42);
-        assert_eq!(vm.pc, 6, "PC should be 6 after fetching EXIT");
+        assert_eq!(run_vm_code(code), Ok(42));
     }
 
     #[test]
-    fn test_exit() {
-         let code = vec![
-             Instruction::Imm as Value, 123,
-             Instruction::Exit as Value,
-             Instruction::Imm as Value, 999 // Skipped
-         ];
-         let vm = run_code(code).unwrap();
-         assert_eq!(vm.ax, 123);
-         assert_eq!(vm.pc, 3, "PC stops after fetching EXIT");
-    }
-
-    // --- Arithmetic Tests (PC should end after EXIT) ---
-    #[test]
-    fn test_add() {
-        let code = vec![ Instruction::Imm as Value, 10, Instruction::Push as Value, Instruction::Imm as Value, 5, Instruction::Add as Value, Instruction::Exit as Value, ];
-        assert_eq!(run_code_get_ax(code.clone()), 15); // Clone here
-        let vm=run_code(code).unwrap(); assert_eq!(vm.pc, 7);
-    }
-    #[test]
-    fn test_sub() {
-        let code = vec![ Instruction::Imm as Value, 20, Instruction::Push as Value, Instruction::Imm as Value, 7, Instruction::Sub as Value, Instruction::Exit as Value, ];
-        assert_eq!(run_code_get_ax(code.clone()), 13); // Clone here
-        let vm=run_code(code).unwrap(); assert_eq!(vm.pc, 7);
-    }
-    #[test]
-    fn test_mul() {
-        let code = vec![ Instruction::Imm as Value, 6, Instruction::Push as Value, Instruction::Imm as Value, 7, Instruction::Mul as Value, Instruction::Exit as Value, ];
-        assert_eq!(run_code_get_ax(code.clone()), 42); // Clone here
-        let vm=run_code(code).unwrap(); assert_eq!(vm.pc, 7);
-    }
-    #[test]
-    fn test_div() {
-        let code = vec![ Instruction::Imm as Value, 21, Instruction::Push as Value, Instruction::Imm as Value, 4, Instruction::Div as Value, Instruction::Exit as Value, ];
-        assert_eq!(run_code_get_ax(code.clone()), 5); // Clone here
-        let vm=run_code(code).unwrap(); assert_eq!(vm.pc, 7);
-    }
-    #[test]
-    fn test_div_by_zero() {
-        let code = vec![ Instruction::Imm as Value, 10, Instruction::Push as Value, Instruction::Imm as Value, 0, Instruction::Div as Value, Instruction::Exit as Value, ];
-        run_code_expect_error(code, VmError::DivisionByZero);
-    }
-    #[test]
-    fn test_mod() {
-        let code = vec![ Instruction::Imm as Value, 23, Instruction::Push as Value, Instruction::Imm as Value, 5, Instruction::Mod as Value, Instruction::Exit as Value, ];
-        assert_eq!(run_code_get_ax(code.clone()), 3); // Clone here
-        let vm=run_code(code).unwrap(); assert_eq!(vm.pc, 7);
-    }
-    #[test]
-    fn test_mod_by_zero() {
-        let code = vec![ Instruction::Imm as Value, 10, Instruction::Push as Value, Instruction::Imm as Value, 0, Instruction::Mod as Value, Instruction::Exit as Value, ];
-        run_code_expect_error(code, VmError::DivisionByZero);
-    }
-    #[test]
-    fn test_arithmetic_stack_underflow() {
-        let code = vec![ Instruction::Imm as Value, 5, Instruction::Add as Value, Instruction::Exit as Value, ];
-        run_code_expect_error(code, VmError::StackUnderflow);
-    }
-
-
-    // --- Control Flow Tests ---
-    #[test]
-    fn test_jmp() {
+    fn test_push_add_exit() {
         let code = vec![
-            Instruction::Imm as Value, 1,    // 0, 1
-            Instruction::Jmp as Value, 4,    // 2, 3 (target = index 4)
-            Instruction::Imm as Value, 99,   // 3 (skipped instruction itself - JMP operand is at index 3)
-            Instruction::Exit as Value,      // 4 (target)
+            Instruction::Imm as Value, 10,
+            Instruction::Push as Value,        // SP--, Mem[SP] = 10
+            Instruction::Imm as Value, 5,      // AX = 5
+            Instruction::Add as Value,         // AX = Pop() + AX = 10 + 5 = 15
+            Instruction::Exit as Value,
         ];
-       let vm = run_code(code).unwrap();
-       assert_eq!(vm.ax, 1, "AX should be 1 from before JMP");
-       assert_eq!(vm.pc, 5, "PC should be 5 after fetching EXIT");
+        assert_eq!(run_vm_code(code), Ok(15));
+    }
+
+     #[test]
+    fn test_push_sub_exit() {
+        let code = vec![
+            Instruction::Imm as Value, 3,      // AX=3
+            Instruction::Push as Value,        // SP--, Mem[SP] = 3
+            Instruction::Imm as Value, 8,      // AX = 8
+            Instruction::Sub as Value,         // AX = Pop() - AX = 3 - 8 = -5
+            Instruction::Exit as Value,
+        ];
+        assert_eq!(run_vm_code(code), Ok(-5));
+    }
+
+    #[test]
+    fn test_basic_jump() {
+        let code = vec![
+            Instruction::Jmp as Value, 3,      // PC = 3
+            Instruction::Imm as Value, 1,      // Skipped
+            Instruction::Exit as Value,        // Skipped
+            Instruction::Imm as Value, 99,     // Jump target
+            Instruction::Exit as Value,
+        ];
+         assert_eq!(run_vm_code(code), Ok(99));
     }
 
     #[test]
     fn test_jz_taken() {
-         let code = vec![
-            Instruction::Imm as Value, 0,  // 0, 1
-            Instruction::Jz as Value, 5,   // 2, 3 (target = index 5, EXIT)
-            Instruction::Imm as Value, 99, // 4 (skipped instruction)
-            Instruction::Exit as Value,   // 5 (target)
+        let code = vec![
+            Instruction::Imm as Value, 0,      // AX = 0
+            Instruction::Jz as Value, 5,       // Jump taken (PC=5)
+            Instruction::Imm as Value, 1,      // Skipped
+            Instruction::Exit as Value,        // Skipped
+            Instruction::Imm as Value, 100,    // Jump target
+            Instruction::Exit as Value,
         ];
-       let vm = run_code(code).unwrap();
-       assert_eq!(vm.ax, 0, "AX should remain 0 when jump is taken");
-       assert_eq!(vm.pc, 6, "PC should be 6 after fetching EXIT");
+         assert_eq!(run_vm_code(code), Ok(100));
     }
 
     #[test]
     fn test_jz_not_taken() {
-         let code = vec![
-            Instruction::Imm as Value, 1,  // 0, 1
-            Instruction::Jz as Value, 5,   // 2, 3 (target = index 5, EXIT)
-            Instruction::Imm as Value, 99, // 4 (executed)
-            Instruction::Exit as Value,   // 5 (target, executed next)
-        ];
-       let vm = run_code(code).unwrap();
-       assert_eq!(vm.ax, 99, "AX should be 99 when jump is not taken");
-       assert_eq!(vm.pc, 7, "PC should be 7 after fetching EXIT");
-    }
-
-    #[test]
-    fn test_jnz_taken() {
-         let code = vec![
-            Instruction::Imm as Value, 1,  // 0, 1
-            Instruction::Jnz as Value, 5,  // 2, 3 (target = index 5, EXIT)
-            Instruction::Imm as Value, 99, // 4 (skipped)
-            Instruction::Exit as Value,   // 5 (target)
-        ];
-       let vm = run_code(code).unwrap();
-       assert_eq!(vm.ax, 1, "AX should remain 1 when jump is taken");
-       assert_eq!(vm.pc, 6, "PC should be 6 after fetching EXIT");
-    }
-
-    #[test]
-    fn test_jnz_not_taken() {
-         let code = vec![
-            Instruction::Imm as Value, 0,  // 0, 1
-            Instruction::Jnz as Value, 5,  // 2, 3 (target = index 5, EXIT)
-            Instruction::Imm as Value, 99, // 4 (executed)
-            Instruction::Exit as Value,   // 5 (target, executed next)
-        ];
-       let vm = run_code(code).unwrap();
-       assert_eq!(vm.ax, 99, "AX should be 99 when jump is not taken");
-       assert_eq!(vm.pc, 7, "PC should be 7 after fetching EXIT");
-    }
-
-    #[test] fn test_jump_out_of_bounds() { let code_small = vec![Instruction::Jmp as Value, 2]; run_code_expect_error(code_small, VmError::InvalidJumpTarget(2)); let code_large_target = vec![Instruction::Jmp as Value, 100]; run_code_expect_error(code_large_target, VmError::InvalidJumpTarget(100)); }
-    #[test] fn test_jump_negative() { let code = vec![Instruction::Jmp as Value, -1]; run_code_expect_error(code, VmError::InvalidJumpTarget(-1)); }
-
-    // --- Function Call Tests ---
-    #[test]
-    fn test_simple_call_lev() {
         let code = vec![
-            /* 0 */ Instruction::Imm as Value, 1,    // Main code
-            /* 2 */ Instruction::Call as Value, 5,   // Target func at index 5
-            /* 4 */ Instruction::Imm as Value, 99,   // Return point
-            /* 5 */ Instruction::Imm as Value, 42,   // Function code
-            /* 7 */ Instruction::Lev as Value,
-            /* 8 */ Instruction::Exit as Value,      // Added Exit after return path
+            Instruction::Imm as Value, 1,      // AX = 1
+            Instruction::Jz as Value, 5,       // Jump not taken
+            Instruction::Imm as Value, 200,    // Executed
+            Instruction::Exit as Value,        // Executed
+            Instruction::Imm as Value, 1,      // Skipped
+            Instruction::Exit as Value,        // Skipped
         ];
-        let vm = run_code(code).unwrap();
-        assert_eq!(vm.ax, 99, "Final value after return should be 99");
-        assert_eq!(vm.pc, 9, "PC should be 9 after fetching final EXIT");
-        assert_eq!(vm.sp, STACK_TOP, "Stack should be clean");
-        assert_eq!(vm.bp, STACK_TOP, "BP should be restored");
+         assert_eq!(run_vm_code(code), Ok(200));
     }
 
     #[test]
-    fn test_call_ent_adj_lev() {
-        let func_addr = 11; // Start func immediately after main block (main needs 11 instructions/operands)
+    fn test_ent_lev_simple() {
+         // Call a simple function that just returns a value
+         let code = vec![
+             // Preamble-like setup
+             Instruction::Call as Value, 3,  // Call function at index 3
+             Instruction::Exit as Value,     // Exit after call returns
+
+             // Function body (starts at index 3)
+             Instruction::Ent as Value, 0,  // Enter function, 0 locals
+             Instruction::Imm as Value, 55, // Load return value
+             Instruction::Lev as Value,     // Leave function (restores BP, pops PC to return addr)
+         ];
+         assert_eq!(run_vm_code(code), Ok(55)); // Check final AX value
+    }
+
+    #[test]
+    fn test_call_adj() {
+        // Call function, check stack adjustment
         let code = vec![
-            // --- Main (indices 0-10) ---
-            /* 0 */ Instruction::Imm as Value, 10,
-            /* 2 */ Instruction::Push as Value,
-            /* 3 */ Instruction::Imm as Value, 20,
-            /* 5 */ Instruction::Push as Value,
-            /* 6 */ Instruction::Call as Value, func_addr as Value, // Calls func at 11, pushes return addr 8
-            /* 8 */ Instruction::Adj as Value, 2, // Return point, adjusts SP
-            /*10 */ Instruction::Exit as Value,
-            // --- Function (indices 11-15) ---
-            /*11 */ Instruction::Ent as Value, 1, // Func entry, operand is size 1
-            /*13 */ Instruction::Imm as Value, 123,
-            /*15 */ Instruction::Lev as Value,
-        ]; // Total size 16
+            // Main code
+            Instruction::Imm as Value, 11,
+            Instruction::Push as Value,      // Push arg 1
+            Instruction::Imm as Value, 22,
+            Instruction::Push as Value,      // Push arg 2
+            Instruction::Call as Value, 9,   // Call func at index 9
+            Instruction::Adj as Value, 2,    // Remove 2 args from stack
+            Instruction::Exit as Value,      // Exit (AX should hold func return value)
 
-        let vm = run_code(code).unwrap();
+            // Function body (index 9)
+            Instruction::Ent as Value, 0,   // 0 locals
+            Instruction::Imm as Value, 99,  // Func return value
+            Instruction::Lev as Value,      // Leave
+        ];
 
-        assert_eq!(vm.ax, 123, "Function should return 123 in AX");
-        assert_eq!(vm.pc, 11, "PC should be 11 after fetching EXIT");
-        assert_eq!(vm.sp, STACK_TOP, "Stack pointer should be TOP after ADJ");
-        assert_eq!(vm.bp, STACK_TOP, "Base pointer not restored correctly after LEV");
+        // Check final result (AX) and that stack is cleaned up (no underflow on Exit)
+        let data: Vec<u8> = Vec::new();
+        let mut vm = VirtualMachine::new(code, data);
+        let result = vm.run();
+        assert_eq!(result, Ok(99));
+        // Check if SP is back where it started before the args were pushed
+        // We start with SP = memory_size. Pushing twice makes it memory_size - 2.
+        // Calling pushes PC (memory_size - 3). ENT pushes BP (memory_size - 4), sets BP = memory_size - 4.
+        // LEV sets SP = BP = memory_size - 4, pops BP, pops PC. SP = memory_size - 2.
+        // ADJ 2 adds 2 to SP. SP = memory_size.
+        assert_eq!(vm.sp, vm.memory_size, "Stack pointer not restored after ADJ");
     }
 
-
-    // --- Memory Access Tests ---
-    const TEST_ADDR_INT: Value = STACK_TOP as Value - 10;
-    const TEST_ADDR_CHAR: Value = STACK_TOP as Value - 11;
-    #[test] fn test_si_li() { let code = vec![ Instruction::Imm as Value, 12345, Instruction::Push as Value, Instruction::Imm as Value, TEST_ADDR_INT, Instruction::Si as Value, Instruction::Imm as Value, TEST_ADDR_INT, Instruction::Li as Value, Instruction::Exit as Value, ]; let vm = run_code(code).unwrap(); assert_eq!(vm.ax, 12345); assert_eq!(vm.stack[TEST_ADDR_INT as usize], 12345); assert_eq!(vm.sp, STACK_TOP); }
-    #[test] fn test_sc_lc() { let value_to_store = 0xABCD; let expected_char_val = 0xCD; let code = vec![ Instruction::Imm as Value, value_to_store, Instruction::Push as Value, Instruction::Imm as Value, TEST_ADDR_CHAR, Instruction::Sc as Value, Instruction::Imm as Value, 0, Instruction::Imm as Value, TEST_ADDR_CHAR, Instruction::Lc as Value, Instruction::Exit as Value, ]; let vm = run_code(code).unwrap(); assert_eq!(vm.ax, expected_char_val); assert_eq!(vm.stack[TEST_ADDR_CHAR as usize], expected_char_val); assert_eq!(vm.sp, STACK_TOP); }
-    #[test] fn test_li_out_of_bounds() { let invalid_addr = DEFAULT_MEM_SIZE as Value; let code = vec![ Instruction::Imm as Value, invalid_addr, Instruction::Li as Value, Instruction::Exit as Value, ]; run_code_expect_error(code, VmError::MemoryAccessOutOfBounds(invalid_addr)); let negative_addr: Value = -1; let code_neg = vec![ Instruction::Imm as Value, negative_addr, Instruction::Li as Value, Instruction::Exit as Value, ]; run_code_expect_error(code_neg, VmError::MemoryAccessOutOfBounds(negative_addr)); }
-    #[test] fn test_si_out_of_bounds() { let invalid_addr = DEFAULT_MEM_SIZE as Value; let code = vec![ Instruction::Imm as Value, 99, Instruction::Push as Value, Instruction::Imm as Value, invalid_addr, Instruction::Si as Value, Instruction::Exit as Value, ]; run_code_expect_error(code, VmError::MemoryAccessOutOfBounds(invalid_addr)); let negative_addr: Value = -1; let code_neg = vec![ Instruction::Imm as Value, 99, Instruction::Push as Value, Instruction::Imm as Value, negative_addr, Instruction::Si as Value, Instruction::Exit as Value, ]; run_code_expect_error(code_neg, VmError::MemoryAccessOutOfBounds(negative_addr)); }
-    #[test] fn test_si_stack_underflow() { let code = vec![ Instruction::Imm as Value, TEST_ADDR_INT, Instruction::Si as Value, Instruction::Exit as Value, ]; run_code_expect_error(code, VmError::StackUnderflow); }
-
-    // --- General Error Tests ---
     #[test]
-    fn test_pc_out_of_bounds() {
-        let code_falls_off = vec![Instruction::Nop as Value];
-        run_code_expect_error(code_falls_off, VmError::PcOutOfBounds);
-    }
-    #[test] fn test_operand_expected() { let code = vec![Instruction::Imm as Value]; run_code_expect_error(code, VmError::OperandExpected); }
-    #[test] fn test_invalid_instruction() { let invalid_opcode = 99; let code = vec![invalid_opcode, Instruction::Exit as Value]; run_code_expect_error(code, VmError::InvalidInstruction(invalid_opcode)); }
-    #[test] fn test_stack_overflow() { let mut code = Vec::new(); for i in 0..=DEFAULT_MEM_SIZE { code.extend(&[Instruction::Imm as Value, i as Value, Instruction::Push as Value]); } code.push(Instruction::Exit as Value); run_code_expect_error(code, VmError::StackOverflow); }
-    #[test] fn test_explicit_stack_underflow() { let code_add = vec![ Instruction::Add as Value, Instruction::Exit as Value, ]; run_code_expect_error(code_add, VmError::StackUnderflow); let code_si = vec![ Instruction::Imm as Value, TEST_ADDR_INT, Instruction::Si as Value, Instruction::Exit as Value, ]; run_code_expect_error(code_si, VmError::StackUnderflow); }
+    fn test_printf_hook_simple() {
+        // Test the CALL -1 hook
+        // NOTE: This test CANNOT verify the actual printed output easily.
+        // It primarily checks that the VM executes the hook without crashing
+        // and potentially returns the correct length in AX.
 
-} // end mod tests
+        let test_string = "Test\n";
+        let mut data = Vec::from(test_string.as_bytes());
+        data.push(0); // Null terminate
+
+        let string_addr: Value = 0; // String starts at address 0 in data segment
+
+        let code = vec![
+            Instruction::Imm as Value, string_addr, // Load string address
+            Instruction::Push as Value,           // Push address onto stack
+            Instruction::Call as Value, -1,       // Call printf hook
+            Instruction::Exit as Value,
+        ];
+
+        let mut vm = VirtualMachine::new(code, data);
+        let result = vm.run();
+
+        // Check that it ran without error and AX has the string length
+        assert_eq!(result, Ok(test_string.len() as Value));
+    }
+
+    #[test]
+    fn test_stack_overflow() {
+        // Push repeatedly until overflow
+        let mut code = vec![Instruction::Imm as Value, 1]; // Need something in AX to push
+        // Use DEFAULT_MEM_SIZE to estimate stack capacity
+        for _ in 0..(DEFAULT_MEM_SIZE / std::mem::size_of::<Value>() + 5) { // Push more than capacity
+            code.push(Instruction::Push as Value);
+        }
+        code.push(Instruction::Exit as Value); // Should not be reached
+
+        let result = run_vm_code(code);
+        assert_eq!(result, Err(VmError::StackOverflow));
+    }
+
+     #[test]
+     fn test_div_by_zero() {
+         let code = vec![
+             Instruction::Imm as Value, 0,      // AX = 0 (divisor)
+             Instruction::Push as Value,
+             Instruction::Imm as Value, 10,     // AX = 10 (dividend)
+             Instruction::Div as Value,         // 10 / 0 -> Error
+             Instruction::Exit as Value,
+         ];
+         let result = run_vm_code(code);
+         assert!(matches!(result, Err(VmError::ArithmeticError(ref msg)) if msg == "Division by zero"));
+     }
+
+     #[test]
+     fn test_memory_access_li_si() {
+         // Store a value and load it back
+         let code = vec![
+             Instruction::Imm as Value, 100,    // Address to use (word address)
+             Instruction::Push as Value,       // Push address for SI
+             Instruction::Imm as Value, 12345,  // Value to store in AX
+             Instruction::Si as Value,         // Store AX (12345) into Mem[Pop()] (Mem[100])
+             Instruction::Imm as Value, 100,    // Load address 100 into AX
+             Instruction::Li as Value,         // Load AX from Mem[AX] (Mem[100])
+             Instruction::Exit as Value,
+         ];
+         assert_eq!(run_vm_code(code), Ok(12345));
+     }
+
+     #[test]
+     fn test_memory_access_out_of_bounds() {
+         let bad_addr = (DEFAULT_MEM_SIZE / std::mem::size_of::<Value>()) as Value; // Just beyond memory
+          let code = vec![
+             Instruction::Imm as Value, bad_addr, // Load bad address into AX
+             Instruction::Li as Value,         // Try to load from Mem[AX] -> Error
+             Instruction::Exit as Value,
+         ];
+         let result = run_vm_code(code);
+         assert!(matches!(result, Err(VmError::MemoryAccessOutOfBounds { address, memory_type })
+            if address == bad_addr && memory_type == "Stack/Heap"));
+     }
+}

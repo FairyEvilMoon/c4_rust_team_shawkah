@@ -1,21 +1,16 @@
-//! Lexer (Tokenizer) for the C4 subset of C.
-//!
-//! This module takes C source code as input (a &str) and produces a stream
-//! of `TokenInfo` structs, each containing a `Token` and its position
-//! (line and column) in the source file. It handles C4 keywords, identifiers,
-//! integer literals, character literals, string literals, operators, punctuation,
-//! and skips whitespace and comments (both // and /* */).
+//! Lexer (Tokenizer) for the C4 subset of C, extended for self-hosting requirements.
 
 use std::iter::Peekable;
 use std::str::Chars;
 
-// --- Token Definition (Covers C4 requirements) ---
+// --- Token Definition (Covers C4 subset + additions) ---
 #[derive(Debug, Clone, PartialEq)]
 pub enum Token {
     Eof,
 
-    // Keywords
+    // Keywords (Ensure all C4 keywords are here)
     Enum, If, Else, Int, Char, Return, Sizeof, While,
+    Void, // Added Void if needed as a type keyword
 
     // Identifiers
     Ident(String),
@@ -23,57 +18,56 @@ pub enum Token {
     // Literals
     Number(i64), // Using i64 for flexibility, original C4 might use i32
     StringLiteral(String),
-    CharLiteral(char),
+    CharLiteral(char), // Single character literal
 
-    // Operators & Punctuation
+    // Operators & Punctuation (Grouped roughly by type/precedence)
     Assign,     // =
+    Cond,       // ?
+    Colon,      // :
+    Lor,        // ||
+    Lan,        // &&
+    BitOr,      // | (Bitwise OR)
+    BitXor,     // ^
+    BitAnd,     // & (Binary Bitwise AND - distinguished from Ampersand for AddressOf)
     Eq, Ne,     // ==, !=
     Lt, Gt, Le, Ge, // <, >, <=, >=
-    Add, Sub, Mul, Div, Mod, // +, -, *, /, %
-    Inc, Dec,   // ++, --
-    BitOr, BitXor, BitAnd, // |, ^, &
-    LogOr, LogAnd, Not,    // ||, &&, !
     Shl, Shr,   // <<, >>
+    Add, Sub,   // +, - (Binary)
+    Mul, Div, Mod, // *, /, % (Binary)
+    Inc, Dec,   // ++, --
+    Not,        // ! (Logical NOT)
+    BitNot,     // ~ (Bitwise NOT)
 
     // Single char symbols / Ambiguous until parsed
     Semicolon, Comma, LParen, RParen, LBrace, RBrace, LBracket, RBracket, // ;, ,, (, ), {, }, [, ]
-    /// Represents the '*' character. Ambiguous: Multiplication or Dereference.
+    /// Represents the '*' character. Ambiguous: Multiplication, Dereference, or Pointer type declaration.
     Asterisk,
-    /// Represents the '&' character. Ambiguous: Bitwise AND or AddressOf.
-    Ampersand,
+    /// Represents the '&' character. Ambiguous: Bitwise AND (handled by BitAnd), or AddressOf.
+    Ampersand, // Use this for unary AddressOf context
+
+    // Special token for system calls if needed (Parser uses SymbolClass::Sys)
+    Sys, // May not be strictly necessary if parser handles via symbol table
 }
 
-// --- Token Information (Includes position) ---
 
-/// Represents a token along with its position in the source code.
+// --- Token Information (Includes position) ---
 #[derive(Debug, Clone, PartialEq)]
 pub struct TokenInfo {
-    /// The specific token type.
     pub token: Token,
-    /// The line number where the token starts (1-based).
     pub line: usize,
-    /// The column number where the token starts (1-based).
     pub column: usize,
-    // Optional: /// The starting byte position of the token in the input string.
-    // pub position: usize,
 }
 
 // --- Lexer Error (Includes positions) ---
-
-/// Represents errors that can occur during the lexing process.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LexerError {
-    /// An unexpected character was encountered. (Char, Line, Column)
     InvalidCharacter(char, usize, usize),
-    /// A string literal was not properly terminated with a double quote. (Start Line, Start Column)
     UnterminatedString(usize, usize),
-    /// A character literal was not properly terminated with a single quote. (Start Line, Start Column)
     UnterminatedChar(usize, usize),
-    /// A block comment (`/*`) was not properly terminated with `*/`. (Start Line, Start Column)
     UnterminatedBlockComment(usize, usize),
-    /// An invalid escape sequence (e.g., `\x`) was found within a literal. (Invalid char after '\', Line, Column)
     InvalidEscapeSequence(char, usize, usize),
-    // TODO: Consider adding IntegerOverflow if parsing i64 fails for very large numbers
+    InvalidNumberFormat(String, usize, usize), // For issues during number parsing
+    // Consider adding IntegerOverflow if i64 parsing fails
 }
 
 impl std::fmt::Display for LexerError {
@@ -84,57 +78,38 @@ impl std::fmt::Display for LexerError {
             LexerError::UnterminatedChar(l, col) => write!(f, "Unterminated character literal starting at {}:{}", l, col),
             LexerError::UnterminatedBlockComment(l, col) => write!(f, "Unterminated block comment starting at {}:{}", l, col),
             LexerError::InvalidEscapeSequence(c, l, col) => write!(f, "Invalid escape sequence '\\{}' at {}:{}", c, l, col),
+            LexerError::InvalidNumberFormat(s, l, col) => write!(f, "Invalid number format '{}' at {}:{}", s, l, col),
         }
     }
 }
-
 impl std::error::Error for LexerError {}
 
 // --- Lexer Implementation ---
-
-/// The Lexer struct holds the state required for tokenizing C source code.
 pub struct Lexer<'a> {
-    /// Peekable iterator over the input characters.
     input: Peekable<Chars<'a>>,
-    /// Current byte position in the input string.
-    current_byte_pos: usize,
-    /// Current line number (1-based).
     current_line: usize,
-    /// Current column number (1-based).
     current_col: usize,
-    /// Byte position where the current line started (used for column calculation reset).
-    line_start_byte_pos: usize,
-     /// Reference to the original source string (can be useful for slicing complex tokens if needed).
-    #[allow(dead_code)] // Keep in case needed later
-    source: &'a str,
+    // Removed byte position trackers for simplicity, rely on line/col
 }
 
 impl<'a> Lexer<'a> {
-    /// Creates a new Lexer for the given input string.
     pub fn new(input: &'a str) -> Self {
         Lexer {
             input: input.chars().peekable(),
-            current_byte_pos: 0,
             current_line: 1,
             current_col: 1,
-            line_start_byte_pos: 0,
-            source: input,
         }
     }
 
-    /// Consumes the next character from the input, updating position trackers.
-    /// Returns the consumed character or None if at EOF.
+    #[inline]
     fn consume(&mut self) -> Option<char> {
         match self.input.next() {
             Some(c) => {
-                self.current_byte_pos += c.len_utf8();
                 if c == '\n' {
                     self.current_line += 1;
                     self.current_col = 1;
-                    self.line_start_byte_pos = self.current_byte_pos;
                 } else {
-                    // Simple column increment for non-newline characters.
-                    // Does not account for tabs expanding (typical for basic compilers).
+                    // Handle tabs potentially if needed, otherwise simple increment
                     self.current_col += 1;
                 }
                 Some(c)
@@ -143,69 +118,48 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    /// Peeks at the next character without consuming it.
-    /// Returns `Some(&char)` or `None` if at EOF.
+    #[inline]
     fn peek(&mut self) -> Option<&char> {
         self.input.peek()
     }
 
-    /// Consumes the next character *if* it matches the expected character.
-    /// Returns `true` if consumed, `false` otherwise.
-    fn consume_if_eq(&mut self, expected: char) -> bool {
-        if self.peek() == Some(&expected) {
-            self.consume(); // Updates position
-            true
-        } else {
-            false
-        }
-    }
+    // Removed consume_if_eq as it was causing borrow issues in next_token
 
-     /// Creates a `TokenInfo` struct with the current token's details.
+    #[inline]
      fn token_info(&self, token: Token, start_line: usize, start_col: usize) -> TokenInfo {
-        TokenInfo {
-            token,
-            line: start_line,
-            column: start_col,
-            // position: start_byte_pos, // optional byte position
-        }
+        TokenInfo { token, line: start_line, column: start_col }
      }
 
-    /// Reads a sequence of digits starting with `first_digit`.
-    /// Assumes `first_digit` has already been consumed.
-    fn read_number(&mut self, first_digit: char, start_line: usize, start_col: usize) -> Result<TokenInfo, LexerError> {
+    fn read_number(&mut self, first_char: char, start_line: usize, start_col: usize) -> Result<TokenInfo, LexerError> {
         let mut number_str = String::new();
-        number_str.push(first_digit);
+        number_str.push(first_char);
+        let base = 10; // Assume decimal unless prefix indicates otherwise
 
+        // C4 doesn't explicitly support 0x or 0 prefixes for hex/octal in its grammar description,
+        // but the code handles it. Let's keep the simpler C4 lexer logic first.
+        // Revert to simpler C4 logic (no hex/octal detection here):
         while let Some(&c) = self.peek() {
-            if c.is_ascii_digit() { // Use ascii_digit for clarity
-                number_str.push(self.consume().unwrap());
+            if c.is_ascii_digit() {
+                 number_str.push(self.consume().unwrap());
             } else {
                 break;
             }
         }
+        // C4 code itself has hex/octal parsing logic, which is complex.
+        // Let's stick to decimal for now unless C4 code parsing fails.
         match number_str.parse::<i64>() {
-            // C4 technically uses int (i32), but i64 provides more range.
-            // Add checks here if strict i32 range is required by assignment constraints.
-            Ok(num) => Ok(self.token_info(Token::Number(num), start_line, start_col)),
-            Err(_) => {
-                // This usually indicates overflow for i64, which is rare for typical C input.
-                // A production compiler might return LexerError::IntegerOverflow here.
-                 panic!(
-                    "Internal Lexer Error: Failed to parse valid number string '{}' (Overflow?) at {}:{}",
-                    number_str, start_line, start_col
-                 )
-            }
+             Ok(num) => Ok(self.token_info(Token::Number(num), start_line, start_col)),
+             Err(_) => Err(LexerError::InvalidNumberFormat(number_str, start_line, start_col)),
         }
+        // TODO: Add hex/octal parsing logic from C4 if needed later, mirroring its complexity.
     }
 
-    /// Reads an identifier (alphanumeric + '_') or a keyword.
-    /// Assumes `first_char` has already been consumed.
+
     fn read_identifier_or_keyword(&mut self, first_char: char, start_line: usize, start_col: usize) -> Result<TokenInfo, LexerError> {
         let mut ident = String::new();
         ident.push(first_char);
 
         while let Some(&c) = self.peek() {
-            // C identifiers allow alphanumeric and underscore
             if c.is_ascii_alphanumeric() || c == '_' {
                 ident.push(self.consume().unwrap());
             } else {
@@ -213,301 +167,227 @@ impl<'a> Lexer<'a> {
             }
         }
 
-        // Check if the identifier is actually a keyword
+        // Check if it's a keyword
         let token = match ident.as_str() {
+            "char" => Token::Char,
+            "else" => Token::Else,
             "enum" => Token::Enum,
             "if" => Token::If,
-            "else" => Token::Else,
             "int" => Token::Int,
-            "char" => Token::Char,
             "return" => Token::Return,
             "sizeof" => Token::Sizeof,
             "while" => Token::While,
-            _ => Token::Ident(ident), // Not a keyword, it's an identifier
+            "void" => Token::Void, // Added void
+            _ => Token::Ident(ident), // Not a keyword
         };
         Ok(self.token_info(token, start_line, start_col))
     }
 
-    /// Reads a string literal enclosed in double quotes. Handles basic C escapes.
-    /// Assumes the opening `"` has already been consumed.
     fn read_string_literal(&mut self, start_line: usize, start_col: usize) -> Result<TokenInfo, LexerError> {
         let mut literal = String::new();
         loop {
-            // Capture position before consuming potentially problematic char (like '\' or '"')
-            // FIX: Prefix with underscore as these are only used for potential immediate errors below
-            let _current_line = self.current_line; // Prefixed
-            let _current_col = self.current_col;  // Prefixed
+            // FIX: Prefix unused variables with underscore
+            let _escape_char_line = self.current_line; // Position before potential consume
+            let _escape_char_col = self.current_col;
 
             match self.consume() {
-                Some('"') => {
-                    // End of string literal
-                    return Ok(self.token_info(Token::StringLiteral(literal), start_line, start_col));
-                }
+                Some('"') => return Ok(self.token_info(Token::StringLiteral(literal), start_line, start_col)),
                 Some('\\') => {
-                    // Handle escape sequence
-                    // We need the position *after* the backslash for accurate error reporting
-                    let escape_char_line = self.current_line;
-                    let escape_char_col = self.current_col;
-                    match self.consume() {
+                     // Use position *after* backslash for escape sequence errors
+                    let esc_seq_line = self.current_line;
+                    let esc_seq_col = self.current_col;
+                    match self.consume() { // Consume character after backslash
                         Some('n') => literal.push('\n'),
                         Some('t') => literal.push('\t'),
-                        Some('"') => literal.push('"'),
                         Some('\\') => literal.push('\\'),
+                        Some('"') => literal.push('"'),
                         Some('0') => literal.push('\0'),
-                        // Other C escapes like \r, \a, \b, \f, \v are less common in simple subsets
-                        Some(other) => {
-                            // Use the position of the character *following* the backslash
-                            return Err(LexerError::InvalidEscapeSequence(other, escape_char_line, escape_char_col));
-                        }
-                        None => {
-                            // EOF right after backslash
-                            return Err(LexerError::UnterminatedString(start_line, start_col));
-                        }
+                        // C4 doesn't handle other escapes like \' in strings
+                        Some(other) => return Err(LexerError::InvalidEscapeSequence(other, esc_seq_line, esc_seq_col)),
+                        None => return Err(LexerError::UnterminatedString(start_line, start_col)),
                     }
                 }
-                Some(c) => {
-                    if c == '\n' {
-                         // Unescaped newline inside string literal is usually an error in C.
-                         // Report the error starting from the beginning of the literal.
-                         // Using _current_line/_current_col here would point to the newline itself,
-                         // but usually the error points to the start.
-                         return Err(LexerError::UnterminatedString(start_line, start_col));
-                    }
-                    literal.push(c);
-                }
-                None => {
-                    // Reached EOF before finding closing quote
-                    return Err(LexerError::UnterminatedString(start_line, start_col));
-                }
+                Some('\n') => return Err(LexerError::UnterminatedString(start_line, start_col)), // Newline in string literal is error
+                Some(c) => literal.push(c),
+                None => return Err(LexerError::UnterminatedString(start_line, start_col)),
             }
         }
     }
 
-    /// Reads a character literal enclosed in single quotes. Handles basic C escapes.
-    /// Assumes the opening `'` has already been consumed.
     fn read_char_literal(&mut self, start_line: usize, start_col: usize) -> Result<TokenInfo, LexerError> {
         let char_val = match self.consume() {
-            Some('\\') => { // Handle escape sequence
-                let escape_line = self.current_line; // Position of the char *after* backslash
+            Some('\'') => return Err(LexerError::UnterminatedChar(start_line, start_col)), // Empty char ''
+            Some('\\') => {
+                let escape_line = self.current_line; // Pos of char *after* backslash
                 let escape_col = self.current_col;
                 match self.consume() {
                     Some('n') => '\n',
                     Some('t') => '\t',
-                    Some('\'') => '\'',
                     Some('\\') => '\\',
+                    Some('\'') => '\'', // Allow \' within char literal
                     Some('0') => '\0',
-                    // Other C escapes...
-                    Some(other) => {
-                        return Err(LexerError::InvalidEscapeSequence(other, escape_line, escape_col));
-                    }
-                    None => {
-                        // EOF right after backslash
-                        return Err(LexerError::UnterminatedChar(start_line, start_col));
-                    }
+                    Some(other) => return Err(LexerError::InvalidEscapeSequence(other, escape_line, escape_col)),
+                    None => return Err(LexerError::UnterminatedChar(start_line, start_col)),
                 }
             }
-            Some('\'') => {
-                // Empty char literal '' is invalid. We consumed the first ', now saw the second one immediately.
-                return Err(LexerError::UnterminatedChar(start_line, start_col)); // Or a more specific error?
-            }
-            Some(c) => {
-                 if c == '\n' {
-                     // Newline in char literal is invalid
-                     return Err(LexerError::UnterminatedChar(start_line, start_col));
-                 }
-                 c
-            }
-            None => {
-                // Reached EOF before finding char or closing quote
-                return Err(LexerError::UnterminatedChar(start_line, start_col));
-            }
+            Some('\n') => return Err(LexerError::UnterminatedChar(start_line, start_col)), // Newline in char literal
+            Some(c) => c,
+            None => return Err(LexerError::UnterminatedChar(start_line, start_col)),
         };
 
-        // Expect the closing single quote
-        if !self.consume_if_eq('\'') {
-            // Found the character (or escape) but not the closing quote
-            return Err(LexerError::UnterminatedChar(start_line, start_col));
-        }
-
-        Ok(self.token_info(Token::CharLiteral(char_val), start_line, start_col))
-    }
-
-    /// Consumes and ignores whitespace characters.
-    fn skip_whitespace(&mut self) {
-        while let Some(&c) = self.peek() {
-            if c.is_whitespace() {
-                self.consume();
-            } else {
-                break;
-            }
+        // Check for closing quote
+        match self.consume() {
+            Some('\'') => Ok(self.token_info(Token::CharLiteral(char_val), start_line, start_col)),
+            _ => Err(LexerError::UnterminatedChar(start_line, start_col)), // Missing closing quote or too many chars
         }
     }
 
-    // Note: Comment skipping is handled directly within `next_token` for robustness.
-    // A separate `skip_comments` function can be tricky if not carefully implemented
-    // to avoid consuming characters that might belong to other tokens (like '/').
 
-    /// Fetches the next token from the input stream.
-    ///
-    /// This is the main entry point for tokenization after creating the Lexer.
-    /// It skips whitespace and comments and returns the next valid `TokenInfo`
-    /// or a `LexerError`. Returns `Ok(TokenInfo { token: Token::Eof, .. })`
-    /// exactly once when the end of the input is reached.
-    pub fn next_token(&mut self) -> Result<TokenInfo, LexerError> {
+    fn skip_whitespace_and_comments(&mut self) -> Result<(), LexerError> {
         loop {
-            // --- 1. Skip Whitespace ---
-            self.skip_whitespace();
+            // Skip whitespace
+            while let Some(&c) = self.peek() {
+                if c.is_whitespace() {
+                    self.consume();
+                } else if c == '#' { // Handle preprocessor directives like comments
+                    // Skip to end of line
+                    while let Some(ch) = self.consume() {
+                        if ch == '\n' { break; }
+                    }
+                    // Loop again to skip potential leading whitespace on the *next* line
+                }
+                 else {
+                    break; // Not whitespace or '#'
+                }
+            }
 
-            // --- 2. Skip Comments (Handle // and /* */) ---
-            // We peek ahead to distinguish comments from division operator '/'
+            // Check for comments after skipping whitespace/directives
             if self.peek() == Some(&'/') {
-                // Need to look at the *next* character without consuming the first '/' yet
-                let mut chars_clone = self.input.clone(); // Clone iterator for peeking
-                chars_clone.next(); // Advance the clone past the first '/'
+                // Clone iterator to peek ahead without consuming the first '/' yet
+                let mut chars_clone = self.input.clone();
+                chars_clone.next();
 
                 match chars_clone.peek() {
-                    Some(&'/') => {
-                        // Found '//', consume the line comment
-                        self.consume(); // Consume the first '/'
-                        self.consume(); // Consume the second '/'
+                    Some(&'/') => { // Line comment "//"
+                        self.consume(); // Consume first '/'
+                        self.consume(); // Consume second '/'
                         while let Some(c) = self.consume() {
-                            if c == '\n' { break; } // Consume until newline or EOF
+                            if c == '\n' { break; }
                         }
-                        continue; // Restart the loop to find the next token
+                        continue; // Restart loop to check for more whitespace/comments after the consumed line
                     }
-                    Some(&'*') => {
-                        // Found '/*', consume the block comment
-                        let comment_start_line = self.current_line; // For error reporting
+                    Some(&'*') => { // Block comment "/*"
+                        let comment_start_line = self.current_line;
                         let comment_start_col = self.current_col;
-                        self.consume(); // Consume the '/'
-                        self.consume(); // Consume the '*'
-
-                        let mut maybe_end = false; // State: Did we just see a '*'?
-                         loop {
-                             match self.consume() {
-                                 Some('*') => maybe_end = true,
-                                 Some('/') if maybe_end => break, // Found '*/', end of comment
-                                 Some(_) => maybe_end = false,    // Any other char resets state
-                                 None => {
-                                     // Reached EOF inside block comment
-                                     return Err(LexerError::UnterminatedBlockComment(comment_start_line, comment_start_col));
-                                 }
-                             }
-                         }
-                         continue; // Restart the loop to find the next token
+                        self.consume(); // Consume '/'
+                        self.consume(); // Consume '*'
+                        let mut maybe_end = false;
+                        loop {
+                            match self.consume() {
+                                Some('*') => maybe_end = true,
+                                Some('/') if maybe_end => break, // Found "*/"
+                                Some(_) => maybe_end = false,
+                                None => return Err(LexerError::UnterminatedBlockComment(comment_start_line, comment_start_col)),
+                            }
+                        }
+                        continue; // Restart loop after consuming block comment
                     }
-                    _ => {
-                        // It's just a single '/', which will be handled as Division below.
-                        // Do nothing here, let the main token logic handle it.
-                    }
+                    _ => break, // Just a single '/', not a comment start
                 }
-            } // End of comment handling ('/')
-
-            // --- 3. Record Token Start Position (after skipping) ---
-            let token_start_line = self.current_line;
-            let token_start_col = self.current_col;
-            // let token_start_byte_pos = self.current_byte_pos; // Optional
-
-            // --- 4. Recognize the Next Token ---
-            match self.consume() {
-                // End Of File
-                None => return Ok(self.token_info(Token::Eof, token_start_line, token_start_col)),
-
-                // Multi-character operators (must check before single-char versions)
-                Some('=') => {
-                    let token = if self.consume_if_eq('=') { Token::Eq } else { Token::Assign };
-                    return Ok(self.token_info(token, token_start_line, token_start_col));
-                }
-                Some('!') => {
-                    let token = if self.consume_if_eq('=') { Token::Ne } else { Token::Not };
-                    return Ok(self.token_info(token, token_start_line, token_start_col));
-                }
-                Some('<') => {
-                    let token = if self.consume_if_eq('=') { Token::Le }
-                                else if self.consume_if_eq('<') { Token::Shl }
-                                else { Token::Lt };
-                    return Ok(self.token_info(token, token_start_line, token_start_col));
-                }
-                 Some('>') => {
-                    let token = if self.consume_if_eq('=') { Token::Ge }
-                                else if self.consume_if_eq('>') { Token::Shr }
-                                else { Token::Gt };
-                    return Ok(self.token_info(token, token_start_line, token_start_col));
-                 }
-                Some('+') => {
-                    let token = if self.consume_if_eq('+') { Token::Inc } else { Token::Add };
-                    return Ok(self.token_info(token, token_start_line, token_start_col));
-                }
-                Some('-') => {
-                    let token = if self.consume_if_eq('-') { Token::Dec } else { Token::Sub };
-                    return Ok(self.token_info(token, token_start_line, token_start_col));
-                }
-                Some('&') => {
-                    // Distinguishes '&' (BitAnd/AddressOf) from '&&' (LogAnd)
-                    let token = if self.consume_if_eq('&') { Token::LogAnd } else { Token::Ampersand };
-                    return Ok(self.token_info(token, token_start_line, token_start_col));
-                }
-                Some('|') => {
-                    // Distinguishes '|' (BitOr) from '||' (LogOr)
-                    let token = if self.consume_if_eq('|') { Token::LogOr } else { Token::BitOr };
-                    return Ok(self.token_info(token, token_start_line, token_start_col));
-                }
-
-                // Single-character operators and punctuation
-                Some('*') => return Ok(self.token_info(Token::Asterisk, token_start_line, token_start_col)), // Ambiguous (Mul/Deref)
-                Some('/') => return Ok(self.token_info(Token::Div, token_start_line, token_start_col)), // Comments handled earlier
-                Some('%') => return Ok(self.token_info(Token::Mod, token_start_line, token_start_col)),
-                Some('^') => return Ok(self.token_info(Token::BitXor, token_start_line, token_start_col)),
-                Some(';') => return Ok(self.token_info(Token::Semicolon, token_start_line, token_start_col)),
-                Some(',') => return Ok(self.token_info(Token::Comma, token_start_line, token_start_col)),
-                Some('(') => return Ok(self.token_info(Token::LParen, token_start_line, token_start_col)),
-                Some(')') => return Ok(self.token_info(Token::RParen, token_start_line, token_start_col)),
-                Some('{') => return Ok(self.token_info(Token::LBrace, token_start_line, token_start_col)),
-                Some('}') => return Ok(self.token_info(Token::RBrace, token_start_line, token_start_col)),
-                Some('[') => return Ok(self.token_info(Token::LBracket, token_start_line, token_start_col)),
-                Some(']') => return Ok(self.token_info(Token::RBracket, token_start_line, token_start_col)),
-
-                // Literals
-                Some('"') => return self.read_string_literal(token_start_line, token_start_col),
-                Some('\'') => return self.read_char_literal(token_start_line, token_start_col),
-
-                // Numbers (start with a digit)
-                Some(c @ '0'..='9') => return self.read_number(c, token_start_line, token_start_col),
-
-                // Identifiers or Keywords (start with letter or underscore)
-                Some(c @ ('a'..='z' | 'A'..='Z' | '_')) => return self.read_identifier_or_keyword(c, token_start_line, token_start_col),
-
-                // --- Error Case ---
-                Some(c) => {
-                    // Any other character is considered invalid in C4's subset
-                    return Err(LexerError::InvalidCharacter(c, token_start_line, token_start_col));
-                }
-           }
-        } // End loop
-    }
-
-    /// Helper function to tokenize the entire input string at once.
-    /// Useful mainly for testing or simple use cases.
-    /// Returns a `Vec<TokenInfo>` on success (including EOF) or the first `LexerError`.
-    #[allow(dead_code)]
-    pub fn tokenize_all(&mut self) -> Result<Vec<TokenInfo>, LexerError> {
-        let mut tokens = Vec::new();
-        loop {
-            let token_info = self.next_token()?;
-            let is_eof = token_info.token == Token::Eof;
-            tokens.push(token_info);
-            if is_eof {
-                break; // Stop after adding the EOF token
+            } else {
+                break; // Not whitespace, not a comment start
             }
         }
-        Ok(tokens)
+        Ok(())
+    }
+
+
+    /// Fetches the next token.
+    pub fn next_token(&mut self) -> Result<TokenInfo, LexerError> {
+        self.skip_whitespace_and_comments()?;
+
+        let start_line = self.current_line;
+        let start_col = self.current_col;
+
+        // Use peek() then consume() for multi-char operators to avoid borrow errors
+        if let Some(first_char) = self.consume() {
+            match first_char {
+                // Multi-char operators check using peek()
+                '=' => {
+                    if self.peek() == Some(&'=') { self.consume(); Ok(self.token_info(Token::Eq, start_line, start_col)) }
+                    else { Ok(self.token_info(Token::Assign, start_line, start_col)) }
+                }
+                '!' => {
+                    if self.peek() == Some(&'=') { self.consume(); Ok(self.token_info(Token::Ne, start_line, start_col)) }
+                    else { Ok(self.token_info(Token::Not, start_line, start_col)) }
+                }
+                '<' => {
+                    if self.peek() == Some(&'=') { self.consume(); Ok(self.token_info(Token::Le, start_line, start_col)) }
+                    else if self.peek() == Some(&'<') { self.consume(); Ok(self.token_info(Token::Shl, start_line, start_col)) }
+                    else { Ok(self.token_info(Token::Lt, start_line, start_col)) }
+                }
+                '>' => {
+                    if self.peek() == Some(&'=') { self.consume(); Ok(self.token_info(Token::Ge, start_line, start_col)) }
+                    else if self.peek() == Some(&'>') { self.consume(); Ok(self.token_info(Token::Shr, start_line, start_col)) }
+                    else { Ok(self.token_info(Token::Gt, start_line, start_col)) }
+                }
+                '+' => {
+                    if self.peek() == Some(&'+') { self.consume(); Ok(self.token_info(Token::Inc, start_line, start_col)) }
+                    else { Ok(self.token_info(Token::Add, start_line, start_col)) }
+                }
+                '-' => {
+                    if self.peek() == Some(&'-') { self.consume(); Ok(self.token_info(Token::Dec, start_line, start_col)) }
+                    else { Ok(self.token_info(Token::Sub, start_line, start_col)) }
+                }
+                '&' => {
+                     // Distinguish && (Lan) from & (Ampersand/BitAnd)
+                    if self.peek() == Some(&'&') { self.consume(); Ok(self.token_info(Token::Lan, start_line, start_col)) }
+                     // C4 uses '&' for bitwise AND in expressions, parser needs to resolve
+                    else { Ok(self.token_info(Token::Ampersand, start_line, start_col)) }
+                }
+                '|' => {
+                    if self.peek() == Some(&'|') { self.consume(); Ok(self.token_info(Token::Lor, start_line, start_col)) }
+                    else { Ok(self.token_info(Token::BitOr, start_line, start_col)) }
+                }
+
+                // Single-char operators and punctuation
+                '*' => Ok(self.token_info(Token::Asterisk, start_line, start_col)),
+                '/' => Ok(self.token_info(Token::Div, start_line, start_col)), // Comments handled
+                '%' => Ok(self.token_info(Token::Mod, start_line, start_col)),
+                '^' => Ok(self.token_info(Token::BitXor, start_line, start_col)),
+                '~' => Ok(self.token_info(Token::BitNot, start_line, start_col)),
+                '?' => Ok(self.token_info(Token::Cond, start_line, start_col)),
+                ':' => Ok(self.token_info(Token::Colon, start_line, start_col)),
+                ';' => Ok(self.token_info(Token::Semicolon, start_line, start_col)),
+                ',' => Ok(self.token_info(Token::Comma, start_line, start_col)),
+                '(' => Ok(self.token_info(Token::LParen, start_line, start_col)),
+                ')' => Ok(self.token_info(Token::RParen, start_line, start_col)),
+                '{' => Ok(self.token_info(Token::LBrace, start_line, start_col)),
+                '}' => Ok(self.token_info(Token::RBrace, start_line, start_col)),
+                '[' => Ok(self.token_info(Token::LBracket, start_line, start_col)),
+                ']' => Ok(self.token_info(Token::RBracket, start_line, start_col)),
+
+                // Literals
+                '"' => self.read_string_literal(start_line, start_col),
+                '\'' => self.read_char_literal(start_line, start_col),
+
+                // Numbers (simple decimal for now, based on C4 lexer)
+                c @ '0'..='9' => self.read_number(c, start_line, start_col),
+
+                // Identifiers or Keywords
+                c @ ('a'..='z' | 'A'..='Z' | '_') => self.read_identifier_or_keyword(c, start_line, start_col),
+
+                // Invalid Character
+                c => Err(LexerError::InvalidCharacter(c, start_line, start_col)),
+            }
+        } else {
+             // End Of File
+             Ok(self.token_info(Token::Eof, start_line, start_col))
+        }
     }
 }
 
 // --- Iterator Implementation ---
-// Allows using the lexer in `for` loops: `for result in Lexer::new(source) { ... }`
-// The iterator yields `Result<TokenInfo, LexerError>` and stops after yielding EOF once
-// (by returning `None` after the EOF token has been successfully processed).
 impl<'a> Iterator for Lexer<'a> {
     type Item = Result<TokenInfo, LexerError>;
 
@@ -515,17 +395,12 @@ impl<'a> Iterator for Lexer<'a> {
         match self.next_token() {
             Ok(token_info) => {
                 if token_info.token == Token::Eof {
-                    // We've successfully produced the EOF token, now stop the iteration.
-                    None
+                    None // Stop iteration after EOF token is generated
                 } else {
-                    // Return the valid token info.
-                    Some(Ok(token_info))
+                    Some(Ok(token_info)) // Return valid token
                 }
             }
-            Err(e) => {
-                // Propagate the error, stopping iteration implicitly on error.
-                 Some(Err(e))
-            }
+            Err(e) => Some(Err(e)), // Return lexer error
         }
     }
 }

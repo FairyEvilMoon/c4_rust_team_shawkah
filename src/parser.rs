@@ -817,96 +817,126 @@ fn parse_global_declaration(&mut self, is_function_hint: bool) -> ParseResult<()
         }
     }
 
-    /// Parses an if (...) stmt [else stmt]
-    fn parse_if_statement(&mut self) -> ParseResult<()> {
-        self.expect_token(Token::If, "if keyword")?;
-        self.expect_token(Token::LParen, "'(' after if")?;
-        // Make sure expression result is loaded if it was an LValue
-        let mut cond_info = self.parse_expression_with_level(PREC_BOTTOM)?; // Condition -> AX
-        if cond_info.is_lvalue {
-             if let Some(load_instr) = cond_info.lvalue_load_instr { self.emit(load_instr); cond_info.is_lvalue = false; cond_info.lvalue_load_instr = None; }
-             else { return Err(ParseError::Other("Internal error: LValue condition missing load instruction".into())); }
-        }
-        self.expect_token(Token::RParen, "')' after if condition")?;
-
-        // Emit branch if zero (condition false)
-        let else_patch_loc = self.reserve_jump_operand(Instruction::Jz); // Jump if Zero
-
-        // Parse 'then' block
-        self.parse_statement()?;
-
-        // Handle 'else'
-        if self.consume_optional(Token::Else)? {
-            // Have 'else', need to jump over it from end of 'then' block
-            let end_patch_loc = self.reserve_jump_operand(Instruction::Jmp); // Jump over else
-
-            // Patch the Jz to jump here (start of else block)
-            let else_start_addr = self.current_code_addr();
-             self.patch_jump_target(else_patch_loc, else_start_addr);
-
-            // Parse 'else' block
+        /// Parses an if (...) stmt [else stmt]
+        fn parse_if_statement(&mut self) -> ParseResult<()> {
+            self.expect_token(Token::If, "if keyword")?;
+            self.expect_token(Token::LParen, "'(' after if")?;
+    
+            // Parse condition expression -> AX (might hold address)
+            let mut cond_info = self.parse_expression_with_level(PREC_BOTTOM)?;
+    
+            // *** ADDED: Load condition value if it's an LValue ***
+            if cond_info.is_lvalue {
+                if let Some(load_instr) = cond_info.lvalue_load_instr {
+                    self.emit(load_instr); // Load the value from address in AX
+                    // cond_info.is_lvalue = false; // State update not critical here
+                } else {
+                     // Error if it claims LValue but has no way to load
+                     let (l, c) = self.current_pos();
+                     return Err(ParseError::Other(format!("Internal error: If Condition LValue missing load instruction near {}:{}", l, c)));
+                }
+            }
+            // *** END ADDED BLOCK ***
+    
+            self.expect_token(Token::RParen, "')' after if condition")?;
+    
+            // Emit branch if zero (condition false, tests value in AX)
+            let else_patch_loc = self.reserve_jump_operand(Instruction::Jz);
+    
+            // Parse 'then' block
             self.parse_statement()?;
-
-            // Patch the JMP to jump here (end of else block)
-            let end_addr = self.current_code_addr();
-            self.patch_jump_target(end_patch_loc, end_addr);
-        } else {
-            // No 'else', patch the Jz to jump here (after 'then' block)
-            let end_addr = self.current_code_addr();
-            self.patch_jump_target(else_patch_loc, end_addr);
+    
+            // Handle 'else'
+            if self.consume_optional(Token::Else)? {
+                // Have 'else', need to jump over it from end of 'then' block
+                let end_patch_loc = self.reserve_jump_operand(Instruction::Jmp); // Jump over else
+    
+                // Patch the Jz to jump here (start of else block)
+                let else_start_addr = self.current_code_addr();
+                 self.patch_jump_target(else_patch_loc, else_start_addr);
+    
+                // Parse 'else' block
+                self.parse_statement()?;
+    
+                // Patch the JMP to jump here (end of else block)
+                let end_addr = self.current_code_addr();
+                self.patch_jump_target(end_patch_loc, end_addr);
+            } else {
+                // No 'else', patch the Jz to jump here (after 'then' block)
+                let end_addr = self.current_code_addr();
+                self.patch_jump_target(else_patch_loc, end_addr);
+            }
+            Ok(())
         }
-        Ok(())
-    }
 
-    /// Parses while (...) stmt
-    fn parse_while_statement(&mut self) -> ParseResult<()> {
-        self.expect_token(Token::While, "while keyword")?;
-        let loop_start_addr = self.current_code_addr(); // Address before condition
-
-        self.expect_token(Token::LParen, "'(' after while")?;
-        // Load condition if LValue
-        let mut cond_info = self.parse_expression_with_level(PREC_BOTTOM)?; // Condition -> AX
-         if cond_info.is_lvalue {
-             if let Some(load_instr) = cond_info.lvalue_load_instr { self.emit(load_instr); cond_info.is_lvalue = false; cond_info.lvalue_load_instr = None;}
-             else { return Err(ParseError::Other("Internal error: LValue condition missing load instruction".into())); }
+        /// Parses while (...) stmt
+        fn parse_while_statement(&mut self) -> ParseResult<()> {
+            self.expect_token(Token::While, "while keyword")?;
+            let loop_start_addr = self.current_code_addr(); // Address before condition
+    
+            self.expect_token(Token::LParen, "'(' after while")?;
+    
+            // Parse condition expression -> AX (might hold address)
+            let mut cond_info = self.parse_expression_with_level(PREC_BOTTOM)?;
+    
+            // *** ADDED: Load condition value if it's an LValue ***
+            if cond_info.is_lvalue {
+                if let Some(load_instr) = cond_info.lvalue_load_instr {
+                    self.emit(load_instr); // Load the value from address in AX
+                    // cond_info.is_lvalue = false; // State update not critical here
+                } else {
+                     let (l, c) = self.current_pos();
+                     return Err(ParseError::Other(format!("Internal error: While Condition LValue missing load instruction near {}:{}", l, c)));
+                }
+            }
+            // *** END ADDED BLOCK ***
+    
+            self.expect_token(Token::RParen, "')' after while condition")?;
+    
+            // Emit branch if zero (condition false, tests value in AX) to exit loop
+            let exit_patch_loc = self.reserve_jump_operand(Instruction::Jz);
+    
+            // Parse loop body
+            self.parse_statement()?;
+    
+            // Jump back to the start of the loop (before condition)
+            self.emit_with_operand(Instruction::Jmp, loop_start_addr as Value);
+    
+            // Patch the Jz to jump here (after the loop body and jump back)
+            let loop_end_addr = self.current_code_addr();
+            self.patch_jump_target(exit_patch_loc, loop_end_addr);
+    
+            Ok(())
         }
-        self.expect_token(Token::RParen, "')' after while condition")?;
 
-        // Emit branch if zero (condition false) to exit loop
-        let exit_patch_loc = self.reserve_jump_operand(Instruction::Jz); // Jump if Zero
-
-        // Parse loop body
-        self.parse_statement()?;
-
-        // Jump back to the start of the loop (before condition)
-        self.emit_with_operand(Instruction::Jmp, loop_start_addr as Value);
-
-        // Patch the Jz to jump here (after the loop body and jump back)
-        let loop_end_addr = self.current_code_addr();
-        self.patch_jump_target(exit_patch_loc, loop_end_addr);
-
-        Ok(())
-    }
-
-     /// Parses return [expr];
-    fn parse_return_statement(&mut self) -> ParseResult<()> {
-        self.expect_token(Token::Return, "return keyword")?;
-        if !self.consume_optional(Token::Semicolon)? {
-            // Has return value
-            let mut ret_info = self.parse_expression_with_level(PREC_BOTTOM)?; // Result -> AX
-            // Load value if LValue
-             if ret_info.is_lvalue {
-                if let Some(load_instr) = ret_info.lvalue_load_instr { self.emit(load_instr); ret_info.is_lvalue = false; ret_info.lvalue_load_instr = None;}
-                else { return Err(ParseError::Other("Internal error: LValue return value missing load instruction".into())); }
-             }
-            // TODO: Check if expression type matches function return type
-            self.expect_token(Token::Semicolon, "';' after return value")?;
+         /// Parses return [expr];
+         fn parse_return_statement(&mut self) -> ParseResult<()> {
+            self.expect_token(Token::Return, "return keyword")?;
+            if !self.consume_optional(Token::Semicolon)? {
+                // Has return value
+                // Parse expression -> AX (might hold address)
+                let mut ret_info = self.parse_expression_with_level(PREC_BOTTOM)?;
+    
+                // *** ADDED: Load return value if it's an LValue ***
+                if ret_info.is_lvalue {
+                    if let Some(load_instr) = ret_info.lvalue_load_instr {
+                        self.emit(load_instr); // Load the value from address in AX
+                        // ret_info.is_lvalue = false; // State update not critical here
+                    } else {
+                        let (l, c) = self.current_pos();
+                        return Err(ParseError::Other(format!("Internal error: Return LValue missing load instruction near {}:{}", l, c)));
+                    }
+                }
+                // *** END ADDED BLOCK ***
+    
+                // TODO: Check if expression type matches function return type
+                self.expect_token(Token::Semicolon, "';' after return value")?;
+            }
+             // If no return value, AX might hold garbage, but C often ignores void returns.
+             // Emit LEV to clean up stack frame and return (uses value currently in AX)
+            self.emit(Instruction::Lev);
+            Ok(())
         }
-         // If no return value, AX might hold garbage, but C often ignores void returns.
-         // Emit LEV to clean up stack frame and return
-        self.emit(Instruction::Lev);
-        Ok(())
-    }
 
      /// Parses { [declarations] [statements] }
     fn parse_block_statement(&mut self) -> ParseResult<()> {
@@ -930,31 +960,16 @@ fn parse_global_declaration(&mut self, is_function_hint: bool) -> ParseResult<()
          Ok(())
     }
 
-     /// Parses expression;
+    /// Parses expression;
     fn parse_expression_statement(&mut self) -> ParseResult<()> {
-        let mut expr_info = self.parse_expression_with_level(PREC_BOTTOM)?;
+        // Parse expression -> AX (might hold address or value)
+        let _expr_info = self.parse_expression_with_level(PREC_BOTTOM)?; // Use _expr_info as we don't use it
+
         // The result in AX is discarded for an expression statement.
-        // Ensure any final LValue is loaded before the semicolon, as its value might
-        // be needed if the expression has side effects that depend on the loaded value,
-        // even if the final value itself isn't used further. However, in C, usually
-        // side effects happen *before* the final value is determined.
-        // Let's stick to the pattern: load if LValue unless used by assignment etc.
-        // The final load *should* happen at the end of parse_expression_with_level.
-         if expr_info.is_lvalue {
-             if let Some(load_instr) = expr_info.lvalue_load_instr {
-                 // This suggests the load at the end of parse_expression_with_level might
-                 // not always occur if the expression ends with an LValue-producing op.
-                 // Let's add the load here for safety in statement context.
-                 self.emit(load_instr);
-                 expr_info.is_lvalue = false;
-                 expr_info.lvalue_load_instr = None;
-             } else {
-                 // This indicates an internal inconsistency.
-                 let (l, c) = self.current_pos();
-                 return Err(ParseError::Other(format!("Internal error: Unused LValue result missing load instruction near {}:{}", l, c)));
-             }
-             // eprintln!("Warning: LValue expression result potentially unused in expression statement near {}:{}", line, col);
-         }
+        // We intentionally DO NOT load the value if it was an LValue here,
+        // as the value itself is not used. Any side effects should have
+        // happened during the parsing of the expression itself.
+
         self.expect_token(Token::Semicolon, "';' after expression statement")?;
         Ok(())
     }
@@ -963,6 +978,10 @@ fn parse_global_declaration(&mut self, is_function_hint: bool) -> ParseResult<()
 
     /// Parses an expression using operator precedence climbing.
     /// Entry point: parse_expression_with_level(PREC_ASSIGN) or PREC_BOTTOM
+    /// Parses an expression using operator precedence climbing.
+    /// Entry point: parse_expression_with_level(PREC_ASSIGN) or PREC_BOTTOM
+    /// Returns ExprInfo indicating if the result in AX is an LValue (address) or RValue.
+    /// Callers are responsible for emitting load instructions if they need the value from an LValue result.
     fn parse_expression_with_level(&mut self, min_precedence: i32) -> ParseResult<ExprInfo> {
         // Parse the left-hand side (primary or unary, handled by parse_primary)
         let mut left_info = self.parse_primary()?; // parse_primary calls parse_postfix_operations internally
@@ -978,7 +997,6 @@ fn parse_global_declaration(&mut self, is_function_hint: bool) -> ParseResult<()
                 let op_token_info = self.next_token()?;
 
                 // --- Sanity check (optional but good) ---
-                // Use Parser::get_operator_precedence here too
                 let current_op_prec = Parser::get_operator_precedence(&op_token_info.token);
                 if current_op_prec != precedence {
                      panic!(
@@ -989,6 +1007,7 @@ fn parse_global_declaration(&mut self, is_function_hint: bool) -> ParseResult<()
 
                 // --- Load LHS LValue if needed (before push/ternary) ---
                 // Exception: Assignment operator *needs* the LValue address.
+                // Other operators generally need the value.
                 if left_info.is_lvalue && op_token_info.token != Token::Assign {
                     if let Some(load_instr) = left_info.lvalue_load_instr {
                         self.emit(load_instr);
@@ -1002,9 +1021,9 @@ fn parse_global_declaration(&mut self, is_function_hint: bool) -> ParseResult<()
 
                 // --- Handle Ternary ---
                 if op_token_info.token == Token::Cond { // '?'
-                    // AX has condition result (already loaded if it was LValue)
+                    // AX has condition result (already loaded if it was LValue by the check above)
                     let else_patch_loc = self.reserve_jump_operand(Instruction::Jz);
-                    // Parse the 'true' expression. Result -> AX
+                    // Parse the 'true' expression. Result -> AX (might be addr)
                     let mut true_expr_info = self.parse_expression_with_level(PREC_COND)?;
                     // Load result if LValue
                     if true_expr_info.is_lvalue {
@@ -1012,7 +1031,10 @@ fn parse_global_declaration(&mut self, is_function_hint: bool) -> ParseResult<()
                              self.emit(load_instr);
                              true_expr_info.is_lvalue = false; // Ensure state is updated
                              true_expr_info.lvalue_load_instr = None;
-                         } else { return Err(ParseError::Other("Internal error: LValue true-expr missing load instruction".into())); }
+                         } else {
+                            let (l, c) = self.current_pos();
+                            return Err(ParseError::Other(format!("Internal error: LValue true-expr missing load instruction near {}:{}", l, c)));
+                        }
                     }
                     // Jump over 'false' expression if condition was true
                     let end_patch_loc = self.reserve_jump_operand(Instruction::Jmp);
@@ -1020,7 +1042,7 @@ fn parse_global_declaration(&mut self, is_function_hint: bool) -> ParseResult<()
                     self.patch_jump_target(else_patch_loc, self.current_code_addr());
                     // Parse the ':'
                     self.expect_token(Token::Colon, "':' for conditional operator")?;
-                    // Parse the 'false' expression. Result -> AX
+                    // Parse the 'false' expression. Result -> AX (might be addr)
                     let mut false_expr_info = self.parse_expression_with_level(PREC_COND)?;
                     // Load result if LValue
                     if false_expr_info.is_lvalue {
@@ -1028,7 +1050,10 @@ fn parse_global_declaration(&mut self, is_function_hint: bool) -> ParseResult<()
                             self.emit(load_instr);
                             false_expr_info.is_lvalue = false; // Ensure state is updated
                             false_expr_info.lvalue_load_instr = None;
-                         } else { return Err(ParseError::Other("Internal error: LValue false-expr missing load instruction".into())); }
+                         } else {
+                            let (l, c) = self.current_pos();
+                            return Err(ParseError::Other(format!("Internal error: LValue false-expr missing load instruction near {}:{}", l, c)));
+                        }
                     }
                     // Patch Jmp to land here (end of conditional)
                     self.patch_jump_target(end_patch_loc, self.current_code_addr());
@@ -1046,7 +1071,7 @@ fn parse_global_declaration(&mut self, is_function_hint: bool) -> ParseResult<()
                 } else {
                      precedence + 1
                 };
-                // Parse the RHS. Result -> AX
+                // Parse the RHS. Result -> AX (might be addr)
                 let mut right_info = self.parse_expression_with_level(next_min_precedence)?;
 
                 // --- Load RHS LValue ---
@@ -1075,25 +1100,10 @@ fn parse_global_declaration(&mut self, is_function_hint: bool) -> ParseResult<()
             }
         } // End binary operator loop
 
-        // --- FINAL LVALUE LOAD ---
-        // After all operators are processed, if the final result (left_info)
-        // is still an LValue (address in AX), load the actual value into AX.
-        // This is necessary for using the expression's value (e.g., in `if (x)`, `return y`, `a = b`).
-        // The only time we *don't* want to load is if this expression is the direct LHS of an assignment,
-        // which is handled by the check `op_token_info.token != Token::Assign` inside the loop.
-        // If the loop doesn't run (e.g., expression is just `x`), or finishes, this load is needed.
-        if left_info.is_lvalue {
-             if let Some(load_instr) = left_info.lvalue_load_instr {
-                 self.emit(load_instr);
-                 left_info.is_lvalue = false;
-                 left_info.lvalue_load_instr = None;
-             } else {
-                 let (l, c) = self.current_pos(); // Use position after last token
-                 return Err(ParseError::Other(format!("Internal error: Final LValue result missing load instruction near {}:{}", l, c)));
-             }
-        }
+        // --- NO FINAL LVALUE LOAD HERE ---
+        // The caller is responsible for loading if the value is needed.
 
-        Ok(left_info) // Return the final expression info (RValue in AX)
+        Ok(left_info) // Return the final expression info (AX may hold address or value)
     }
 
      /// Gets the precedence level of a binary operator token.
@@ -1421,16 +1431,42 @@ fn parse_global_declaration(&mut self, is_function_hint: bool) -> ParseResult<()
                 if expr_info.is_lvalue { if let Some(load_instr) = expr_info.lvalue_load_instr { self.emit(load_instr); expr_info.is_lvalue = false; expr_info.lvalue_load_instr = None; } else { return Err(ParseError::Other("Internal error: LValue operand for unary - missing load instruction".into())); } }
                 if !expr_info.data_type.is_int_or_char() { return Err(ParseError::TypeMismatch("Cannot apply unary minus to non-arithmetic type".into(), token_info.line, token_info.column)); }
                 self.emit(Instruction::Neg); expr_info.is_lvalue = false; }
-            Token::Inc | Token::Dec => { /* Existing Prefix ++/-- logic */
-                let op = token_info.token; let inner_info = self.parse_expression_with_level(PREC_UNARY)?;
-                if !inner_info.is_lvalue { return Err(ParseError::NotAnLValue("prefix ++/-- operand".into(), token_info.line, token_info.column)); }
-                let load_instr = inner_info.lvalue_load_instr.ok_or_else(|| ParseError::NotAnLValue("prefix ++/-- operand load instr missing".into(), token_info.line, token_info.column))?;
-                self.emit(Instruction::Push); self.emit(load_instr); self.emit(Instruction::Push); self.emit_with_operand(Instruction::Imm, 1);
-                if inner_info.data_type.is_pointer() { let element_type = inner_info.data_type.deref().unwrap_or(DataType::Char); self.emit_pointer_scaling(element_type); }
-                self.emit(if op == Token::Inc { Instruction::Add } else { Instruction::Sub }); self.emit_store(&inner_info.data_type)?;
-                // Result of prefix is the new value, already in AX after store
-                expr_info = ExprInfo { data_type: inner_info.data_type, is_lvalue: false, lvalue_load_instr: None }; }
-            // --- Error Cases ---
+                Token::Inc | Token::Dec => { // Prefix ++/-- logic
+                    let op = token_info.token;
+                    // Parse the operand *after* the ++/--
+                    // This call NO LONGER auto-loads the LValue
+                    let inner_info = self.parse_expression_with_level(PREC_UNARY)?;
+    
+                    // This check should now work correctly if the operand is an LValue
+                    if !inner_info.is_lvalue {
+                        return Err(ParseError::NotAnLValue("prefix ++/-- operand".into(), token_info.line, token_info.column));
+                    }
+    
+                    // Ensure we have the load instruction associated with the LValue type.
+                    let load_instr = inner_info.lvalue_load_instr.ok_or_else(|| ParseError::Other(format!(
+                        "Internal error: LValue for prefix ++/-- at {}:{} missing load instruction", // Adjusted error message
+                        token_info.line, token_info.column
+                    )))?;
+    
+                    // inner_info.is_lvalue is TRUE, so AX holds the ADDRESS.
+    
+                    // Generate code for prefix ++/--:
+                    self.emit(Instruction::Push); // 1. Push the address (from AX)
+                    self.emit(load_instr);        // 2. Load the original value -> AX
+                    self.emit(Instruction::Push); // 3. Push the original value (onto address)
+                    self.emit_with_operand(Instruction::Imm, 1); // 4. Prepare amount (1) -> AX
+                    if inner_info.data_type.is_pointer() { // Check if the LValue is a pointer type
+                        // Pointer arithmetic: Need to scale the increment/decrement amount
+                        let element_type = inner_info.data_type.deref().unwrap_or(DataType::Char); // Get pointed-to type
+                        self.emit_pointer_scaling(element_type); // Scale amount in AX (1) by element size
+                    }
+                    // 5. Calculate new value: stack=[addr, orig_val], AX=scaled_1
+                    self.emit(if op == Token::Inc { Instruction::Add } else { Instruction::Sub }); // AX = orig_val + scaled_1 = new_value (pops orig_val)
+                    // 6. Store the new value (AX) back to the address (pops addr)
+                    self.emit_store(&inner_info.data_type)?;
+                    // 7. Result of prefix ++/-- is the NEW value, which is already in AX. Result is RValue.
+                    expr_info = ExprInfo { data_type: inner_info.data_type, is_lvalue: false, lvalue_load_instr: None };
+                }            // --- Error Cases ---
             Token::Eof => return Err(ParseError::UnexpectedToken { expected: "primary expression".into(), found: token_info.token, line: token_info.line, column: token_info.column }),
             _ => return Err(ParseError::UnexpectedToken { expected: "primary expression".into(), found: token_info.token, line: token_info.line, column: token_info.column }),
         }

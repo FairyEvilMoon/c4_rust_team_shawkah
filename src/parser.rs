@@ -1411,11 +1411,23 @@ fn parse_global_declaration(&mut self, is_function_hint: bool) -> ParseResult<()
                  if inner_info.is_lvalue { if let Some(load_instr) = inner_info.lvalue_load_instr { self.emit(load_instr); inner_info.is_lvalue = false; inner_info.lvalue_load_instr = None; } else { return Err(ParseError::Other("Internal error: LValue operand for * missing load instruction".into())); } }
                  if let DataType::Ptr(target_type) = inner_info.data_type { let target_load_instr = Some(if *target_type == DataType::Char { Instruction::Lc } else { Instruction::Li }); expr_info = ExprInfo { data_type: *target_type, is_lvalue: true, lvalue_load_instr: target_load_instr }; }
                  else { return Err(ParseError::InvalidDereference(token_info.line, token_info.column)); } }
-            Token::Ampersand => { /* Existing Address-of (&) logic */
-                let inner_info = self.parse_expression_with_level(PREC_UNARY)?;
-                 if !inner_info.is_lvalue { return Err(ParseError::InvalidAddressOf(token_info.line, token_info.column)); }
-                expr_info = ExprInfo { data_type: DataType::Ptr(Box::new(inner_info.data_type)), is_lvalue: false, lvalue_load_instr: None }; }
-            Token::Not => { /* Existing Logical NOT (!) logic */
+                 Token::BitAnd => { // *** CHANGED HERE from Token::Ampersand ***
+                    // Parse operand expression; result -> AX (MUST be address for '&')
+                    let inner_info = self.parse_expression_with_level(PREC_UNARY)?;
+                
+                    // Operand MUST be an LValue. We DO NOT load the value.
+                    if !inner_info.is_lvalue {
+                        // Use the original token's info for error reporting
+                        return Err(ParseError::InvalidAddressOf(token_info.line, token_info.column));
+                    }
+                    // AX holds the address. The result of '&' is that address, but it's an RValue.
+                    // The type becomes Ptr(operand_type).
+                    expr_info = ExprInfo {
+                        data_type: DataType::Ptr(Box::new(inner_info.data_type)), // Create pointer type
+                        is_lvalue: false, // The result of '&' itself is not an LValue
+                        lvalue_load_instr: None // Not an LValue, so no load instruction
+                    };
+                }            Token::Not => { /* Existing Logical NOT (!) logic */
                 let mut inner_info = self.parse_expression_with_level(PREC_UNARY)?;
                 if inner_info.is_lvalue { if let Some(load_instr) = inner_info.lvalue_load_instr { self.emit(load_instr); inner_info.is_lvalue = false; inner_info.lvalue_load_instr = None; } else { return Err(ParseError::Other("Internal error: LValue operand for ! missing load instruction".into())); } }
                 self.emit_with_operand(Instruction::Imm, 0); self.emit(Instruction::Eq); expr_info = ExprInfo { data_type: DataType::Int, is_lvalue: false, lvalue_load_instr: None }; }

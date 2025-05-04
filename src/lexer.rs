@@ -404,11 +404,14 @@ impl<'a> Lexer<'a> {
                     else { Ok(self.token_info(Token::Sub, start_line, start_col)) }
                 }
                 '&' => {
-                     // Distinguish && (Lan) from & (Ampersand/BitAnd)
-                    if self.peek() == Some(&'&') { self.consume(); Ok(self.token_info(Token::Lan, start_line, start_col)) }
-                     // C4 uses '&' for bitwise AND in expressions, parser needs to resolve
-                    else { Ok(self.token_info(Token::Ampersand, start_line, start_col)) }
-                }
+    if self.peek() == Some(&'&') {
+        self.consume(); // Consume the second '&'
+        Ok(self.token_info(Token::Lan, start_line, start_col)) // Logical AND &&
+    } else {
+        // Emit BitAnd for single '&'. Parser will determine unary/binary use.
+        Ok(self.token_info(Token::BitAnd, start_line, start_col)) // *** CHANGED HERE ***
+    }
+}
                 '|' => {
                     if self.peek() == Some(&'|') { self.consume(); Ok(self.token_info(Token::Lor, start_line, start_col)) }
                     else { Ok(self.token_info(Token::BitOr, start_line, start_col)) }
@@ -478,12 +481,3 @@ impl<'a> Iterator for Lexer<'a> {
 }
 
 // Add a field to Lexer to track the last emitted token if needed for EOF handling in iterator
-impl<'a> Lexer<'a> {
-    // Add this field to the Lexer struct definition
-    // current_token_info: Option<TokenInfo>, // Tracks the last emitted token
-
-    // Initialize it in new()
-    // current_token_info: None,
-
-    // Update it in the iterator's next() method (as shown above)
-}

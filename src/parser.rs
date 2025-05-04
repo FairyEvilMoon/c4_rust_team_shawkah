@@ -562,18 +562,35 @@ fn parse_global_declaration(&mut self, is_function_hint: bool) -> ParseResult<()
             if self.peek_token()? == Some(&Token::RBrace) { break; }
 
             let (name, name_info) = self.expect_identifier("enum member name")?;
-
+            
             // Optional assignment
             if self.consume_optional(Token::Assign)? {
-                 // Allow optional unary minus before number literal
+                // Allow optional unary minus before number literal
                 let negative = self.consume_optional(Token::Sub)?;
-                // Use parse_expression here to handle potential negative constants?
-                // C4 likely only allows simple integer literals here.
-                let val_token = self.expect_token(Token::Number(0), "integer value for enum member")?; // Expect Num, value irrelevant here
-                if let Token::Number(mut num_val) = val_token.token {
-                     if negative { num_val = -num_val; }
-                     current_enum_value = num_val;
-                } else { unreachable!(); } // Should be caught by expect_token if lexer is correct
+
+                // Get the next token, expecting a number literal
+                let val_token_info = self.next_token()?; // Consume the token after '=' or '-'
+
+                // Check if the consumed token is a Number variant
+                if let Token::Number(mut num_val) = val_token_info.token {
+                    if negative {
+                        // Apply negation, checking for overflow
+                        num_val = num_val.checked_neg().ok_or_else(|| ParseError::Other(format!(
+                            "Enum value negation overflow for '{}' at {}:{}",
+                            name, // Use the name parsed earlier
+                            val_token_info.line, val_token_info.column
+                        )))?;
+                    }
+                    current_enum_value = num_val;
+                } else {
+                    // Token after '=' or '-' was not a number
+                    return Err(ParseError::UnexpectedToken {
+                        expected: "integer value for enum member".to_string(),
+                        found: val_token_info.token, // Report the token we actually found
+                        line: val_token_info.line,
+                        column: val_token_info.column,
+                    });
+                }
             }
 
             // Add enum member to symbol table

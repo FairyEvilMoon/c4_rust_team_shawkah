@@ -4,7 +4,7 @@ This project is a rewrite of the original ["C in 4 Functions" (C4)](https://gith
 
 ## Objective
 
-Rewrite the C4 compiler (lexer, parser, virtual machine) in Rust, ensuring it compiles the same subset of C as the original C4, including the C4 source code itself (`examples/c4.c`). The project emphasizes Rust's safety, idiomatic usage, collaboration via Git/GitHub, testing, and documentation.
+Rewrite the C4 compiler (lexer, parser, virtual machine) in Rust, ensuring it compiles the same subset of C as the original C4 (`examples/c4.c`). The project emphasizes Rust's safety, idiomatic usage, collaboration via Git/GitHub, testing, and documentation.
 
 ## Features
 

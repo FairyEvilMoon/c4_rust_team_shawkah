@@ -10,7 +10,7 @@ Rewrite the C4 compiler (lexer, parser, virtual machine) in Rust, ensuring it co
 
 *   Compiles a subset of C language.
 *   Targets a simple virtual machine.
-*   Self-hosting: The Rust version can compile the original `c4.c` source code.
+*   Self-hosting: The Rust version can compile source code written in `C`.
 *   Written in idiomatic Rust with safety guarantees.
 *   Unit and integration tests.
 *   Documentation generated via `cargo doc`.

@@ -36,7 +36,7 @@ pub enum Instruction {
     Neg = 32, Not = 33, // Negate, Logical NOT (!=0 -> 0, ==0 -> 1)
 
     // C4 Syscalls/Library Functions mapped to Opcodes
-    Open = 34, Read = 35, Clos = 36, Prtf = 37, Malc = 38, Free = 39, Mset = 40, Mcmp = 41,
+    Open = 34, Read = 35, Clos = 36, Prtf = 37, Malc = 38, Free = 39, Mset = 40, Mcmp = 41,Pow = 42,
     // NOTE: C4's EXIT is mapped to opcode 42, but we use Instruction::Exit (opcode 3) for VM control.
 }
 
@@ -60,7 +60,7 @@ impl TryFrom<Value> for Instruction {
             // Syscalls
             34 => Ok(Instruction::Open), 35 => Ok(Instruction::Read), 36 => Ok(Instruction::Clos),
             37 => Ok(Instruction::Prtf), 38 => Ok(Instruction::Malc), 39 => Ok(Instruction::Free),
-            40 => Ok(Instruction::Mset), 41 => Ok(Instruction::Mcmp),
+            40 => Ok(Instruction::Mset), 41 => Ok(Instruction::Mcmp), 42 => Ok(Instruction::Pow),
             _ => Err(VmError::InvalidInstruction(value)),
         }
     }
@@ -741,6 +741,37 @@ impl VirtualMachine {
                         }
                     }
                     self.ax = result; // 0 if equal, <0 if s1<s2, >0 if s1>s2
+                 }
+            }
+
+            Instruction::Pow => {
+                // Stack: [base_val (lhs)], AX: exponent_val (rhs)
+                let exponent = self.ax;
+                let base = self.pop()?; // Pop base from stack
+    
+                // Integer exponentiation: Use checked_pow
+                // checked_pow requires a u32 exponent. Handle errors.
+                if exponent < 0 {
+                    return Err(VmError::ArithmeticError(format!(
+                        "Negative exponent ({}) not supported for integer power", exponent
+                    )));
+                }
+                 // Check if exponent fits in u32
+                 match u32::try_from(exponent) {
+                     Ok(exp_u32) => {
+                         match base.checked_pow(exp_u32) {
+                            Some(result) => self.ax = result,
+                            None => return Err(VmError::ArithmeticError(format!(
+                                "Exponentiation overflow: {} ** {}", base, exponent
+                            ))),
+                        }
+                     }
+                     Err(_) => {
+                         // Exponent too large for u32
+                          return Err(VmError::ArithmeticError(format!(
+                             "Exponent ({}) too large for integer power", exponent
+                         )));
+                     }
                  }
             }
 

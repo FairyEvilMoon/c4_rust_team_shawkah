@@ -28,8 +28,9 @@ const PREC_REL:    i32 = 9; // < <= > >=
 const PREC_SHIFT:  i32 = 10; // << >>
 const PREC_ADD:    i32 = 11; // + -
 const PREC_MUL:    i32 = 12; // * / %
-const PREC_UNARY:  i32 = 13; // ++ -- (prefix) * & ! ~ + - (unary) sizeof cast
-const PREC_POSTFIX:i32 = 14; // () [] ++ -- (postfix)
+const PREC_POW:    i32 = 13; // ** higher then mul/div
+const PREC_UNARY:  i32 = 14; // ++ -- (prefix) * & ! ~ + - (unary) sizeof cast
+const PREC_POSTFIX:i32 = 15; // () [] ++ -- (postfix)
 
 // --- Parser Error (Keep existing definition or enhance as needed) ---
 #[derive(Debug, Clone, PartialEq)]
@@ -1120,14 +1121,14 @@ fn parse_global_declaration(&mut self, is_function_hint: bool) -> ParseResult<()
             Token::Lt | Token::Gt | Token::Le | Token::Ge => PREC_REL,
             Token::Shl | Token::Shr => PREC_SHIFT,
             Token::Add | Token::Sub => PREC_ADD, // Binary + -
-            Token::Mul | Token::Div | Token::Mod => PREC_MUL, // Binary * / %
+            Token::Mul | Token::Div | Token::Mod => PREC_MUL,Token::Pow => PREC_POW, // Binary * / %
             // Postfix ops handled separately by parse_postfix_operations
             _ => PREC_BOTTOM, // Not a binary operator we handle here
         }
     }
     // Helper for right-associative operators
      fn is_right_associative(token: &Token) -> bool {
-        matches!(token, Token::Assign | Token::Cond)
+        matches!(token, Token::Assign | Token::Cond | Token::Pow)
      }
 
      /// Emits VM code for a binary operator.
@@ -1213,6 +1214,19 @@ fn parse_global_declaration(&mut self, is_function_hint: bool) -> ParseResult<()
             Token::Mul => { self.emit(Instruction::Mul); result_type = DataType::Int; }
             Token::Div => { self.emit(Instruction::Div); result_type = DataType::Int; }
             Token::Mod => { self.emit(Instruction::Mod); result_type = DataType::Int; }
+
+            Token::Pow => {
+                // Stack: [lhs_val], AX: rhs_val (exponent)
+                // Ensure both operands are integer types for basic exponentiation
+                if !left.data_type.is_int_or_char() || !right.data_type.is_int_or_char() {
+                    let (l, c) = self.current_pos();
+                    return Err(ParseError::TypeMismatch("Operands for '**' must be integer types".into(), l, c));
+                }
+                // Assume VM has a Pow instruction
+                self.emit(Instruction::Pow);
+                result_type = DataType::Int; // Result is typically Int
+                // Result is RValue
+            }
 
             // Relational (==, !=, <, >, <=, >=) -> Result is always Int (0 or 1)
             Token::Eq => { self.emit(Instruction::Eq); result_type = DataType::Int; }

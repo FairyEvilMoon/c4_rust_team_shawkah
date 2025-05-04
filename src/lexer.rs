@@ -37,6 +37,7 @@ pub enum Token {
     Inc, Dec,   // ++, --
     Not,        // ! (Logical NOT)
     BitNot,     // ~ (Bitwise NOT)
+    Pow,        // ** (Exponential)
 
     // Single char symbols / Ambiguous until parsed
     Semicolon, Comma, LParen, RParen, LBrace, RBrace, LBracket, RBracket, // ;, ,, (, ), {, }, [, ]
@@ -403,6 +404,16 @@ impl<'a> Lexer<'a> {
                     if self.peek() == Some(&'-') { self.consume(); Ok(self.token_info(Token::Dec, start_line, start_col)) }
                     else { Ok(self.token_info(Token::Sub, start_line, start_col)) }
                 }
+                '*' => {
+                // Check for ** (exponentiation)
+                if self.peek() == Some(&'*') {
+                    self.consume(); // Consume the second '*'
+                    Ok(self.token_info(Token::Pow, start_line, start_col)) // Return Pow token
+                } else {
+                    // Otherwise, it's the ambiguous Asterisk
+                    Ok(self.token_info(Token::Asterisk, start_line, start_col))
+                }
+            }
                 '&' => {
     if self.peek() == Some(&'&') {
         self.consume(); // Consume the second '&'

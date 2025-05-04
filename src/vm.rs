@@ -3,15 +3,16 @@
 use std::convert::TryFrom;
 // Required for libc calls and C string handling
 use std::ffi::CString; // Removed unused CStr
-// Removed: use std::os::unix::ffi::OsStrExt; // This is Unix-specific and wasn't strictly needed
+// Removed: use std::os::unix::ffi::OsStrExt;
 
 // --- Types and Constants ---
 
 pub type Value = i32; // VM uses 32-bit integers
+pub const VALUE_SIZE_BYTES: usize = std::mem::size_of::<Value>();
 pub const DEFAULT_MEM_SIZE_WORDS: usize = 256 * 1024; // 256k words = 1MB for i32
-pub const DEFAULT_MEM_SIZE_BYTES: usize = DEFAULT_MEM_SIZE_WORDS * std::mem::size_of::<Value>();
+pub const DEFAULT_MEM_SIZE_BYTES: usize = DEFAULT_MEM_SIZE_WORDS * VALUE_SIZE_BYTES;
 // Stack grows downwards from high memory in this model
-pub const STACK_TOP_ADDR_WORDS: usize = DEFAULT_MEM_SIZE_WORDS;
+pub const STACK_TOP_ADDR_WORDS: usize = DEFAULT_MEM_SIZE_WORDS; // Initial SP value
 
 // --- Instructions ---
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,7 +26,7 @@ pub enum Instruction {
     Jmp = 9, Jz = 10, Jnz = 11,
     // Function Call Mechanism
     Call = 12, Ent = 13, Adj = 14, Lev = 15,
-    // Memory Access
+    // Memory Access (Now generally using byte addresses)
     Li = 16, Lc = 17, Si = 18, Sc = 19, Lea = 20, // Load Integer, Load Char, Store Int, Store Char, Load Effective Address
     // Bitwise/Logical (Pop() op AX) -> AX = Op1 op Op2
     Or  = 21, Xor = 22, And = 23, Shl = 24, Shr = 25,
@@ -37,9 +38,6 @@ pub enum Instruction {
     // C4 Syscalls/Library Functions mapped to Opcodes
     Open = 34, Read = 35, Clos = 36, Prtf = 37, Malc = 38, Free = 39, Mset = 40, Mcmp = 41,
     // NOTE: C4's EXIT is mapped to opcode 42, but we use Instruction::Exit (opcode 3) for VM control.
-    // The parser should map C's `exit()` call to our Instruction::Exit.
-    // We will handle the PRTF opcode here explicitly, although the Call instruction
-    // handler might also check for a magic address like -1 if desired.
 }
 
 // --- Instruction TryFrom<Value> ---
@@ -63,8 +61,6 @@ impl TryFrom<Value> for Instruction {
             34 => Ok(Instruction::Open), 35 => Ok(Instruction::Read), 36 => Ok(Instruction::Clos),
             37 => Ok(Instruction::Prtf), 38 => Ok(Instruction::Malc), 39 => Ok(Instruction::Free),
             40 => Ok(Instruction::Mset), 41 => Ok(Instruction::Mcmp),
-            // Note: C4 EXIT (42) is handled by mapping `exit()` in parser to our `Instruction::Exit` (3)
-
             _ => Err(VmError::InvalidInstruction(value)),
         }
     }
@@ -76,20 +72,22 @@ impl TryFrom<Value> for Instruction {
 pub enum VmError {
     InvalidInstruction(Value),
     PcOutOfBounds,
-    StackOverflow,
+    StackOverflow, // Collision between stack and heap
     StackUnderflow,
-    HeapOverflow, // For simulated malloc
+    HeapOverflow, // For simulated malloc (or stack collision)
     OperandExpected,
     ArithmeticError(String),
     InvalidJumpTarget(Value),
-    MemoryAccessOutOfBounds { address: Value, memory_type: String },
+    MemoryAccessOutOfBounds { address: Value, size: usize, op_name: String }, // Byte address, size in bytes
+    UnalignedMemoryAccess { address: Value, op_name: String }, // For instructions that might require alignment
     InvalidShiftAmount(Value),
-    DataSegmentAccessError(String),
-    InvalidSyscall(Value), // Keep for potential future use
+    // DataSegmentAccessError(String), // Removed, data segment is part of unified memory
+    InvalidSyscall(Value),
     InvalidFileDescriptor(Value),
     NullPointerAccess(String),
     CStringError(String), // Errors reading C strings from memory
     IoError(String), // Wrapper for underlying IO errors
+    InitializationError(String),
 }
 
 impl std::fmt::Display for VmError {
@@ -97,20 +95,22 @@ impl std::fmt::Display for VmError {
          match self {
             VmError::InvalidInstruction(v) => write!(f, "Invalid instruction opcode: {}", v),
             VmError::PcOutOfBounds => write!(f, "Program counter out of code bounds"),
-            VmError::StackOverflow => write!(f, "Stack overflow"),
+            VmError::StackOverflow => write!(f, "Stack overflow (collided with heap or memory start)"),
             VmError::StackUnderflow => write!(f, "Stack underflow"),
-            VmError::HeapOverflow => write!(f, "Heap overflow (simulated malloc failed)"),
+            VmError::HeapOverflow => write!(f, "Heap overflow (allocation failed or collided with stack)"),
             VmError::OperandExpected => write!(f, "Operand expected, but reached end of code"),
             VmError::ArithmeticError(s) => write!(f, "Arithmetic error: {}", s),
             VmError::InvalidJumpTarget(v) => write!(f, "Invalid jump target address in code: {}", v),
-            VmError::MemoryAccessOutOfBounds{ address, memory_type } => write!(f, "{} memory access out of bounds at address: 0x{:X} ({})", memory_type, address, address),
+            VmError::MemoryAccessOutOfBounds{ address, size, op_name } => write!(f, "Memory access out of bounds during '{}': address=0x{:X} ({}), size={} bytes", op_name, address, address, size),
+            VmError::UnalignedMemoryAccess { address, op_name } => write!(f, "Unaligned memory access during '{}' at byte address 0x{:X} ({})", op_name, address, address),
             VmError::InvalidShiftAmount(v) => write!(f, "Invalid shift amount: {}", v),
-            VmError::DataSegmentAccessError(s) => write!(f, "Data Segment access error: {}", s),
+            // VmError::DataSegmentAccessError(s) => write!(f, "Data Segment access error: {}", s), // Removed
             VmError::InvalidSyscall(v) => write!(f, "Invalid syscall number: {}", v),
             VmError::InvalidFileDescriptor(v) => write!(f, "Invalid file descriptor: {}", v),
             VmError::NullPointerAccess(s) => write!(f, "Null pointer access during {}", s),
             VmError::CStringError(s) => write!(f, "C String error: {}", s),
             VmError::IoError(s) => write!(f, "I/O Error: {}", s),
+            VmError::InitializationError(s) => write!(f, "VM Initialization Error: {}", s),
         }
     }
 }
@@ -121,52 +121,84 @@ impl std::error::Error for VmError {}
 #[derive(Debug)]
 pub struct VirtualMachine {
     // Registers
-    pc: usize,
-    pub sp: usize, // Stack pointer (word index, starts high)
-    bp: usize, // Base pointer (word index)
+    pc: usize, // Program Counter (index into `code` vector)
+    pub sp: usize, // Stack pointer (WORD index into `memory`, starts high, grows down)
+    bp: usize, // Base pointer (WORD index into `memory`)
     ax: Value, // Accumulator
 
     // Memory
     code: Vec<Value>,
-    memory: Vec<Value>,    // Combined Stack/Heap area (words)
-    data_segment: Vec<u8>, // Static data (bytes)
-    heap_ptr: usize,       // Simulated heap pointer (word index, starts low)
+    // *** Unified Memory Area ***
+    // Holds Data Segment, BSS, Heap (growing up), and Stack (growing down)
+    memory: Vec<Value>,        // Main memory, accessed as words or bytes
+    heap_ptr: usize,           // Heap pointer (WORD index, starts after data/bss, grows up)
 
     // State
     running: bool,
     code_size: usize,
-    pub memory_size_words: usize,
+    memory_size_words: usize,  // Total size of `memory` in words
+    memory_size_bytes: usize,  // Total size of `memory` in bytes
 }
 
 
 impl VirtualMachine {
-    /// Creates a new VM with code, data segment, and default memory size.
-    pub fn new(code: Vec<Value>, data_segment: Vec<u8>) -> Self {
-        Self::with_memory_size(code, data_segment, DEFAULT_MEM_SIZE_WORDS)
+    /// Creates a new VM with code, initial data, and default memory size.
+    pub fn new(code: Vec<Value>, initial_data: Vec<u8>) -> Result<Self, VmError> {
+        Self::with_memory_size(code, initial_data, DEFAULT_MEM_SIZE_WORDS)
     }
 
     /// Creates a new VM with specific memory size (in words).
-    pub fn with_memory_size(code: Vec<Value>, data_segment: Vec<u8>, memory_words: usize) -> Self {
+    /// The `initial_data` is copied to the beginning of the unified `memory`.
+    pub fn with_memory_size(code: Vec<Value>, initial_data: Vec<u8>, memory_words: usize) -> Result<Self, VmError> {
         if memory_words == 0 {
-            panic!("Memory size must be at least 1 word");
+            return Err(VmError::InitializationError("Memory size must be at least 1 word".to_string()));
         }
-        let memory = vec![0; memory_words]; // Initialize memory with zeros
+        let memory_size_bytes = memory_words.checked_mul(VALUE_SIZE_BYTES)
+            .ok_or_else(|| VmError::InitializationError("Memory size in bytes calculation overflowed".to_string()))?;
+
+        if initial_data.len() > memory_size_bytes {
+             return Err(VmError::InitializationError(format!(
+                 "Initial data size ({} bytes) exceeds total memory size ({} bytes)",
+                 initial_data.len(), memory_size_bytes
+             )));
+        }
+
+        let mut memory = vec![0 as Value; memory_words]; // Initialize memory with zeros
+
+        // Copy initial data into the beginning of the memory vector using byte access
+        if !initial_data.is_empty() {
+            // Get a mutable byte slice of the beginning of `memory`
+            let memory_bytes: &mut [u8] = unsafe {
+                std::slice::from_raw_parts_mut(
+                    memory.as_mut_ptr() as *mut u8,
+                    memory_size_bytes // Use the total byte capacity
+                )
+            };
+            // Copy data into the slice
+            memory_bytes[..initial_data.len()].copy_from_slice(&initial_data);
+        }
+
+        // Calculate initial heap pointer (word index) to start *after* the initial data/bss
+        // Round up data size to the nearest word boundary
+        let data_words = (initial_data.len() + VALUE_SIZE_BYTES - 1) / VALUE_SIZE_BYTES;
+        let initial_heap_ptr = data_words; // Heap starts immediately after the data words
+
         let code_size = code.len();
         let initial_sp = memory_words; // SP starts just *past* the end (stack grows down)
 
-        VirtualMachine {
+        Ok(VirtualMachine {
             pc: 0,
             sp: initial_sp,
             bp: initial_sp, // BP initially same as SP
             ax: 0,
             code,
             memory,
-            data_segment,
-            heap_ptr: 0, // Heap starts at the beginning of memory
+            heap_ptr: initial_heap_ptr, // Heap starts after copied data
             running: false,
             code_size,
             memory_size_words: memory_words,
-        }
+            memory_size_bytes: memory_size_bytes,
+        })
     }
 
     // --- Fetching ---
@@ -199,120 +231,116 @@ impl VirtualMachine {
     // --- Stack Operations ---
     #[inline]
     fn push(&mut self, value: Value) -> Result<(), VmError> {
-        // Stack grows down, check collision with heap_ptr
-        if self.sp == 0 || self.sp <= self.heap_ptr {
+        // Stack grows down (sp decreases). Check collision with heap_ptr (heap grows up).
+        // `sp` points to the *next available* slot. `heap_ptr` points *past* the current heap.
+        // Collision occurs if the *new* sp would be <= heap_ptr.
+        if self.sp == 0 || (self.sp - 1) < self.heap_ptr {
             Err(VmError::StackOverflow)
         } else {
-            self.sp -= 1;
-            self.memory[self.sp] = value;
-            Ok(())
+            self.sp -= 1; // Decrement SP *before* writing
+            // Bounds check (redundant if sp > 0 check is sufficient, but safer)
+            if self.sp >= self.memory_size_words {
+                 Err(VmError::StackOverflow) // Should not happen if initial checks work
+            } else {
+                self.memory[self.sp] = value;
+                Ok(())
+            }
         }
     }
 
     #[inline]
     fn pop(&mut self) -> Result<Value, VmError> {
-        // Underflow if SP is at or beyond the initial top
+        // Stack grows down, so pop increases SP.
+        // Underflow if SP is at or beyond the initial top address.
         if self.sp >= self.memory_size_words {
             Err(VmError::StackUnderflow)
         } else {
             let value = self.memory[self.sp];
-            self.sp += 1;
+            self.sp += 1; // Increment SP *after* reading
             Ok(value)
         }
     }
 
-    // --- Memory Validation and Access ---
+    // --- Memory Validation and Access (Unified Memory, Byte Addressing) ---
 
-    // Accesses memory as words (Value)
+    /// Validates a byte address and size for memory access.
+    /// Returns the starting byte index if valid.
     #[inline]
-    fn validate_mem_word_addr(&self, addr_val: Value, op_name: &str) -> Result<usize, VmError> {
-        if addr_val < 0 {
-            return Err(VmError::MemoryAccessOutOfBounds { address: addr_val, memory_type: format!("{} word", op_name) });
+    fn validate_byte_access(&self, byte_addr_val: Value, access_size_bytes: usize, op_name: &str) -> Result<usize, VmError> {
+        if byte_addr_val < 0 {
+            return Err(VmError::MemoryAccessOutOfBounds { address: byte_addr_val, size: access_size_bytes, op_name: op_name.to_string() });
         }
-        let addr_usize = addr_val as usize;
-        // Check against memory size in WORDS
-        if addr_usize >= self.memory_size_words {
-            return Err(VmError::MemoryAccessOutOfBounds { address: addr_val, memory_type: format!("{} word", op_name) });
+        if access_size_bytes == 0 {
+            // Allow 0-byte access at valid address or just past the end
+             let start_byte = byte_addr_val as usize;
+             if start_byte <= self.memory_size_bytes {
+                 return Ok(start_byte)
+             } else {
+                 return Err(VmError::MemoryAccessOutOfBounds { address: byte_addr_val, size: 0, op_name: op_name.to_string() });
+             }
         }
-        Ok(addr_usize)
+
+        let start_byte = byte_addr_val as usize;
+        let end_byte = start_byte.checked_add(access_size_bytes).ok_or_else(|| VmError::ArithmeticError(format!("Address overflow calculating end boundary for '{}'", op_name)))?;
+
+        // Check if the entire range [start_byte, end_byte) is within bounds
+        if end_byte > self.memory_size_bytes {
+            // Report the address that caused the violation (could be start or partway through)
+            let offending_addr = if start_byte >= self.memory_size_bytes { start_byte } else { self.memory_size_bytes } as Value;
+            return Err(VmError::MemoryAccessOutOfBounds { address: offending_addr, size: access_size_bytes, op_name: op_name.to_string() });
+        }
+        Ok(start_byte)
     }
 
-    // Accesses memory as bytes, using byte address
+    /// Gets a single byte from unified memory using a byte address.
     #[inline]
     fn get_mem_byte(&self, byte_addr_val: Value, op_name: &str) -> Result<u8, VmError> {
-        if byte_addr_val < 0 {
-            return Err(VmError::MemoryAccessOutOfBounds { address: byte_addr_val, memory_type: format!("{} byte", op_name) });
-        }
-        let byte_addr = byte_addr_val as usize;
-        let word_index = byte_addr / std::mem::size_of::<Value>();
-        let byte_offset = byte_addr % std::mem::size_of::<Value>();
+        let byte_addr = self.validate_byte_access(byte_addr_val, 1, op_name)?;
 
-        // Check against memory size in WORDS
-        if word_index >= self.memory_size_words {
-             return Err(VmError::MemoryAccessOutOfBounds { address: byte_addr_val, memory_type: format!("{} byte (word boundary check)", op_name) });
-        }
+        let word_index = byte_addr / VALUE_SIZE_BYTES;
+        let byte_offset = byte_addr % VALUE_SIZE_BYTES;
+
+        // Redundant check, validate_byte_access should cover this
+        // if word_index >= self.memory_size_words { ... }
 
         let word = self.memory[word_index];
         // Assuming little-endian byte order within the Value (i32)
         Ok((word >> (byte_offset * 8)) as u8)
     }
 
+    /// Sets a single byte in unified memory using a byte address.
     #[inline]
     fn set_mem_byte(&mut self, byte_addr_val: Value, byte_val: u8, op_name: &str) -> Result<(), VmError> {
-        if byte_addr_val < 0 {
-            return Err(VmError::MemoryAccessOutOfBounds { address: byte_addr_val, memory_type: format!("{} byte", op_name) });
-        }
-        let byte_addr = byte_addr_val as usize;
-        let word_index = byte_addr / std::mem::size_of::<Value>();
-        let byte_offset = byte_addr % std::mem::size_of::<Value>();
+        let byte_addr = self.validate_byte_access(byte_addr_val, 1, op_name)?;
 
-        // Check against memory size in WORDS
-        if word_index >= self.memory_size_words {
-             return Err(VmError::MemoryAccessOutOfBounds { address: byte_addr_val, memory_type: format!("{} byte (word boundary check)", op_name) });
-        }
+        let word_index = byte_addr / VALUE_SIZE_BYTES;
+        let byte_offset = byte_addr % VALUE_SIZE_BYTES;
 
+        // Redundant check, validate_byte_access should cover this
+        // if word_index >= self.memory_size_words { ... }
+
+        // Read-Modify-Write the containing word
         let word = &mut self.memory[word_index];
-        let mask = !(0xFF << (byte_offset * 8));
-        *word = (*word & mask) | ((byte_val as Value) << (byte_offset * 8));
+        let mask = !(0xFF << (byte_offset * 8)); // Mask to clear the target byte
+        *word = (*word & mask) | ((byte_val as Value) << (byte_offset * 8)); // Set the new byte
         Ok(())
     }
 
-     // Helper to get a mutable slice of the VM's memory (for read/write syscalls, memset, memcmp)
-     // Takes byte address and byte count. Validates bounds.
+     /// Helper to get a mutable byte slice of the VM's unified memory.
+     /// Takes byte address and byte count. Validates bounds.
     fn get_memory_slice_mut(&mut self, byte_addr: Value, count: Value, op_name: &str) -> Result<&mut [u8], VmError> {
-        if byte_addr < 0 || count < 0 {
-            // Check for negative address or count first
-            let invalid_addr = if byte_addr < 0 { byte_addr } else { count }; // Report the problematic value
-             return Err(VmError::MemoryAccessOutOfBounds { address: invalid_addr, memory_type: format!("{} slice (negative address/count)", op_name) });
+        if count < 0 {
+             return Err(VmError::MemoryAccessOutOfBounds { address: count, size: 0, op_name: format!("{} slice (negative count)", op_name) });
         }
-        let start_byte = byte_addr as usize;
         let num_bytes = count as usize;
-        let end_byte = start_byte.checked_add(num_bytes).ok_or_else(|| VmError::ArithmeticError(format!("Address overflow calculating end of {} slice: {} + {}", op_name, start_byte, num_bytes)))?;
-
-        // Check if the byte range is within the total byte capacity of the memory
-        let total_mem_bytes = self.memory_size_words.checked_mul(std::mem::size_of::<Value>())
-            .ok_or_else(|| VmError::ArithmeticError("Overflow calculating total memory bytes".to_string()))?;
-
-        if end_byte > total_mem_bytes {
-            // Report the address that goes out of bounds (end_byte - 1)
-            let oob_addr = (end_byte - 1) as Value;
-            return Err(VmError::MemoryAccessOutOfBounds { address: oob_addr, memory_type: format!("{} slice end", op_name) });
-        }
-         // Handle zero-length slice requested at the very end of memory
-        if start_byte == total_mem_bytes && num_bytes == 0 {
-             return Ok(&mut []);
-        }
-        // Check start boundary as well (although end_byte > total_mem_bytes should cover it unless num_bytes is 0)
-        if start_byte > total_mem_bytes {
-             return Err(VmError::MemoryAccessOutOfBounds { address: byte_addr, memory_type: format!("{} slice start", op_name) });
-        }
-
+        let start_byte = self.validate_byte_access(byte_addr, num_bytes, op_name)?;
+        let end_byte = start_byte + num_bytes; // Already validated by validate_byte_access
 
         // Get a mutable slice of the underlying Vec<Value> as bytes
         let memory_bytes: &mut [u8] = unsafe {
             std::slice::from_raw_parts_mut(
                 self.memory.as_mut_ptr() as *mut u8,
-                total_mem_bytes // Use the actual total byte capacity
+                self.memory_size_bytes // Use the actual total byte capacity
             )
         };
 
@@ -320,18 +348,7 @@ impl VirtualMachine {
         Ok(&mut memory_bytes[start_byte..end_byte])
     }
 
-
-    #[inline]
-    fn validate_data_segment_address(&self, addr_val: Value) -> Result<usize, VmError> {
-        if addr_val < 0 {
-             return Err(VmError::MemoryAccessOutOfBounds { address: addr_val, memory_type: "Data Segment".to_string()});
-        }
-        let addr_usize = addr_val as usize;
-        if addr_usize >= self.data_segment.len() {
-             return Err(VmError::MemoryAccessOutOfBounds { address: addr_val, memory_type: "Data Segment".to_string()});
-        }
-        Ok(addr_usize)
-    }
+    // Removed: validate_data_segment_address
 
     #[inline]
     fn validate_jump_target(&self, target_val: Value) -> Result<usize, VmError> {
@@ -342,43 +359,38 @@ impl VirtualMachine {
          Ok(target_pc)
     }
 
-    /// Reads a null-terminated C string from memory (stack/heap or data segment).
+    /// Reads a null-terminated C string from unified memory.
     /// `addr_val` is the starting byte address.
-    fn read_c_string(&self, addr_val: Value, max_len: usize, location: &str) -> Result<CString, VmError> {
-        if addr_val < 0 {
-            return Err(VmError::MemoryAccessOutOfBounds { address: addr_val, memory_type: format!("{} C string", location) });
+    /// `max_len` prevents reading excessive amounts of memory.
+    fn read_c_string(&self, addr_val: Value, max_len: usize, op_name: &str) -> Result<CString, VmError> {
+        if addr_val == 0 { // Check NULL pointer
+            return Err(VmError::NullPointerAccess(format!("reading C string for {}", op_name)));
         }
-        if addr_val == 0 { // Consider NULL pointer
-            return Err(VmError::NullPointerAccess(format!("reading {} C string", location)));
-        }
+        // Initial validation just for the starting byte
+        let _ = self.validate_byte_access(addr_val, 1, &format!("C string start for {}", op_name))?;
 
         let mut bytes = Vec::new();
-        let mut current_addr = addr_val;
+        let mut current_addr_val = addr_val;
 
         loop {
-            let byte = match location {
-                 "Data Segment" => {
-                    let byte_idx = self.validate_data_segment_address(current_addr)?;
-                    self.data_segment[byte_idx]
-                 }
-                 "Memory" => {
-                    // Use get_mem_byte for stack/heap access (byte address)
-                    self.get_mem_byte(current_addr, "C string in Memory")?
-                 }
-                 _ => panic!("Invalid location specified for read_c_string: {}", location),
-            };
+            // We need to check each byte access individually inside the loop
+            let byte = self.get_mem_byte(current_addr_val, &format!("C string read for {}", op_name))?;
 
             if byte == 0 { break; } // Null terminator found
             bytes.push(byte);
-            current_addr = current_addr.checked_add(1).ok_or_else(|| VmError::ArithmeticError("Address overflow reading C String".to_string()))?;
 
+            // Check length limit
             if bytes.len() >= max_len {
-                 return Err(VmError::CStringError(format!("String from {} at 0x{:X} exceeded max length {}", location, addr_val, max_len)));
+                 return Err(VmError::CStringError(format!("String for {} starting at 0x{:X} exceeded max length {}", op_name, addr_val, max_len)));
             }
+
+            // Increment byte address, checking for potential overflow
+            current_addr_val = current_addr_val.checked_add(1).ok_or_else(|| VmError::ArithmeticError(format!("Address overflow reading C String for {} near 0x{:X}", op_name, current_addr_val)))?;
         }
 
-        // Check if CString::new can actually fail (e.g., internal null bytes)
-        CString::new(bytes).map_err(|e| VmError::CStringError(format!("Invalid byte sequence in C string from {} at 0x{:X}: {}", location, addr_val, e)))
+        // CString::new checks for interior null bytes, which shouldn't happen if our loop is correct,
+        // but it's good practice to handle the Result.
+        CString::new(bytes).map_err(|e| VmError::CStringError(format!("Invalid byte sequence found in C string for {} at 0x{:X}: {}", op_name, addr_val, e)))
     }
 
 
@@ -397,50 +409,42 @@ impl VirtualMachine {
     // --- Execution Loop ---
     pub fn run(&mut self) -> Result<Value, VmError> {
         if self.running {
-            // Prevent re-entry if already running (e.g., nested calls from error handling)
-            // This might need more sophisticated handling depending on use case.
-             return Err(VmError::IoError("VM already running".to_string())); // Use IoError or a new variant
+             return Err(VmError::IoError("VM already running".to_string())); // Or a specific state error
         }
         self.running = true;
-        let mut final_result: Result<Value, VmError> = Ok(self.ax); // Default result if loop doesn't run
+        let mut final_result: Result<Value, VmError> = Ok(self.ax); // Default result
 
         while self.running {
-             // Check PC bounds *before* fetching instruction
             if self.pc >= self.code_size {
                  if self.pc == self.code_size {
-                     // Normal termination: reached end of code
                      self.running = false;
-                     final_result = Ok(self.ax); // Use AX value at termination
+                     final_result = Ok(self.ax);
                  } else {
-                     // Error: PC somehow went beyond code size
                      final_result = Err(VmError::PcOutOfBounds);
                      self.running = false;
                  }
-                 break; // Exit loop
+                 break;
              }
 
-            // Store PC before execution in case of error reporting
             let current_pc = self.pc;
             match self.fetch_instruction().and_then(|instr| self.execute(instr)) {
                 Ok(()) => {
-                    // Instruction executed successfully, continue loop
-                    // Check running flag again in case execute set it to false (e.g. Exit)
-                    if !self.running {
-                       final_result = Ok(self.ax); // Exit instruction sets AX
+                    if !self.running { // Check if Instruction::Exit was executed
+                       final_result = Ok(self.ax);
                     }
                 }
                 Err(e) => {
-                    // An error occurred
-                    eprintln!("VM Error at PC=0x{:X}: {}", current_pc, e); // Print error immediately for debugging
-                    self.dump_registers(); // Optionally dump state on error
+                    eprintln!("VM Error at PC=0x{:X}: {}", current_pc, e);
+                    self.dump_registers();
                     self.dump_stack(10);
+                    // self.dump_memory_section(0, 32).ok(); // Optional: dump start of memory
                     final_result = Err(e);
-                    self.running = false; // Stop execution on any error
+                    self.running = false;
                 }
             }
         }
 
-        self.running = false; // Ensure running is false on exit
+        self.running = false;
         final_result
     }
 
@@ -453,38 +457,30 @@ impl VirtualMachine {
             Instruction::Imm => { self.ax = self.fetch_operand()?; }
             Instruction::Push => self.push(self.ax)?,
             Instruction::Exit => {
-                // C function exit() places return code in AX before calling this.
-                // This instruction stops the VM. The run loop will return current AX.
-                self.running = false;
+                self.running = false; // The run loop will capture AX
             }
 
-            // --- Arithmetic ---
+            // --- Arithmetic / Bitwise / Relational / Unary --- (No changes needed here)
             Instruction::Add => { let op = self.pop()?; self.ax = self.checked_add(op, self.ax)?; }
-            Instruction::Sub => { let op = self.pop()?; self.ax = self.checked_sub(op, self.ax)?; } // Order op - ax
+            Instruction::Sub => { let op = self.pop()?; self.ax = self.checked_sub(op, self.ax)?; }
             Instruction::Mul => { let op = self.pop()?; self.ax = self.checked_mul(op, self.ax)?; }
-            Instruction::Div => { let op = self.pop()?; self.ax = self.checked_div(op, self.ax)?; } // Order op / ax
-            Instruction::Mod => { let op = self.pop()?; self.ax = self.checked_rem(op, self.ax)?; } // Order op % ax
-
-            // --- Bitwise/Logical ---
+            Instruction::Div => { let op = self.pop()?; self.ax = self.checked_div(op, self.ax)?; }
+            Instruction::Mod => { let op = self.pop()?; self.ax = self.checked_rem(op, self.ax)?; }
             Instruction::Or => { let op = self.pop()?; self.ax = op | self.ax; }
             Instruction::Xor => { let op = self.pop()?; self.ax = op ^ self.ax; }
             Instruction::And => { let op = self.pop()?; self.ax = op & self.ax; }
-            Instruction::Shl => { let shift_amount = self.pop()?; self.ax = self.checked_shl(self.ax, shift_amount)?; } // Order ax << amount
-            Instruction::Shr => { let shift_amount = self.pop()?; self.ax = self.checked_shr(self.ax, shift_amount)?; } // Order ax >> amount
-
-            // --- Relational/Equality (Order: op CMP ax) ---
+            Instruction::Shl => { let shift_amount = self.pop()?; self.ax = self.checked_shl(self.ax, shift_amount)?; }
+            Instruction::Shr => { let shift_amount = self.pop()?; self.ax = self.checked_shr(self.ax, shift_amount)?; }
             Instruction::Eq => { let op = self.pop()?; self.ax = if op == self.ax { 1 } else { 0 }; }
             Instruction::Ne => { let op = self.pop()?; self.ax = if op != self.ax { 1 } else { 0 }; }
             Instruction::Lt => { let op = self.pop()?; self.ax = if op < self.ax { 1 } else { 0 }; }
             Instruction::Gt => { let op = self.pop()?; self.ax = if op > self.ax { 1 } else { 0 }; }
             Instruction::Le => { let op = self.pop()?; self.ax = if op <= self.ax { 1 } else { 0 }; }
             Instruction::Ge => { let op = self.pop()?; self.ax = if op >= self.ax { 1 } else { 0 }; }
-
-            // --- Unary ---
             Instruction::Neg => { self.ax = self.checked_neg(self.ax)?; }
-            Instruction::Not => { self.ax = if self.ax == 0 { 1 } else { 0 }; } // Logical NOT
+            Instruction::Not => { self.ax = if self.ax == 0 { 1 } else { 0 }; }
 
-            // --- Control Flow ---
+            // --- Control Flow --- (No changes needed here)
             Instruction::Jmp => { let target = self.fetch_operand()?; self.pc = self.validate_jump_target(target)?; }
             Instruction::Jz => { let target = self.fetch_operand()?; if self.ax == 0 { self.pc = self.validate_jump_target(target)?; } }
             Instruction::Jnz => { let target = self.fetch_operand()?; if self.ax != 0 { self.pc = self.validate_jump_target(target)?; } }
@@ -493,120 +489,129 @@ impl VirtualMachine {
             Instruction::Call => {
                 let target_addr_val = self.fetch_operand()?;
                 let target_pc = self.validate_jump_target(target_addr_val)?;
-                 // Push *next* instruction address as return address
-                 let return_pc = self.pc as Value;
+                 let return_pc = self.pc as Value; // PC points to the *next* instruction
                  self.push(return_pc)?;
-                 self.pc = target_pc; // Jump
+                 self.pc = target_pc;
             }
-            Instruction::Ent => {
+            Instruction::Ent => { // Enter function, allocate local stack frame
                 let locals_size_words_val = self.fetch_operand()?;
                 if locals_size_words_val < 0 { return Err(VmError::ArithmeticError(format!("ENT operand must be non-negative: {}", locals_size_words_val))); }
                 let locals_size_words = locals_size_words_val as usize;
 
                 self.push(self.bp as Value)?; // Push old BP
-                self.bp = self.sp;            // New BP is current SP (before allocating locals)
+                self.bp = self.sp;            // New BP is current SP (top of frame before locals)
 
-                // Check if allocating locals would overflow stack (hit heap or go below 0)
+                // Allocate space for locals by decrementing SP. Check against heap_ptr.
                 let next_sp = self.sp.checked_sub(locals_size_words);
                 match next_sp {
-                     Some(sp) if sp >= self.heap_ptr => { // Check against heap ptr
+                     // Check if new SP is valid *and* >= heap_ptr
+                     Some(sp) if sp >= self.heap_ptr => {
                          self.sp = sp;
-                         // Optional: Zero out local variable space? C doesn't guarantee this.
+                         // Optional: Zero out locals? C doesn't guarantee this.
                          // for i in 0..locals_size_words { self.memory[self.sp + i] = 0; }
                      }
-                     _ => { // Stack overflow
-                         // Restore BP before erroring? Maybe not necessary as VM stops.
-                         // self.bp = self.pop()? as usize; // This might fail if stack is truly messed up
+                     _ => { // Stack overflow (hit heap or wrapped below 0)
+                         // Don't need to restore BP, VM will stop
                          return Err(VmError::StackOverflow);
                      }
                  }
             }
-            Instruction::Adj => {
+            Instruction::Adj => { // Adjust stack pointer after call (remove arguments)
                 let arg_count_val = self.fetch_operand()?;
                  if arg_count_val < 0 { return Err(VmError::ArithmeticError(format!("ADJ operand must be non-negative: {}", arg_count_val))); }
-                 let arg_count = arg_count_val as usize;
+                 let arg_count_words = arg_count_val as usize;
 
                  // Adjust SP upwards to remove arguments pushed by caller
-                 let new_sp = self.sp.checked_add(arg_count);
+                 let new_sp = self.sp.checked_add(arg_count_words);
                  match new_sp {
                      // Check if new SP is valid (doesn't go beyond original memory top)
                      Some(sp) if sp <= self.memory_size_words => self.sp = sp,
-                     _ => return Err(VmError::StackUnderflow), // Removing too many args?
+                     _ => return Err(VmError::StackUnderflow), // Removing too many args or overflow
                  }
             }
-            Instruction::Lev => { // Leave function
-                 // Check if BP is valid before using it
-                 if self.bp >= self.memory_size_words {
-                     // This suggests BP corruption or stack underflow before LEV
+            Instruction::Lev => { // Leave function, restore stack frame
+                 // Check if BP is valid before using it (should point within allocated stack)
+                 if self.bp > self.memory_size_words || self.bp < self.sp {
+                     // BP seems invalid or points outside the current stack bounds
                      return Err(VmError::StackUnderflow); // Or a specific BP error
                  }
-                 // Deallocate locals and args space managed by ENT/ADJ within the callee
-                 self.sp = self.bp; // SP = BP (BP points *before* locals/old BP)
+                 // Deallocate locals: SP = BP (BP points *before* locals/old BP)
+                 self.sp = self.bp;
 
-                 // Restore caller's BP
-                 self.bp = self.pop()? as usize; // Pop old BP (need validation?)
+                 // Restore caller's BP (pop from stack)
+                 let old_bp_val = self.pop()?;
+                 // Basic validation for popped BP value
+                 if old_bp_val < 0 || old_bp_val as usize > self.memory_size_words {
+                    return Err(VmError::StackUnderflow); // Popped invalid BP
+                 }
+                 self.bp = old_bp_val as usize;
 
                  // Pop return address
                  let return_pc_val = self.pop()?;
                  self.pc = self.validate_jump_target(return_pc_val)?; // Jump back
             }
 
-            // --- Memory Access ---
-            Instruction::Lea => { // Load Effective Address (bp + offset)
-                let offset = self.fetch_operand()?;
-                 // BP is a word index, offset is typically words too in C4 stack frames
-                 // Let's treat offset as a raw value to add to BP (word index)
-                 // The *result* is an address (potentially byte address depending on usage?)
-                 // C4 LEA likely calculates stack address (word index). Let's assume result is word index based.
-                 // Need to be careful if LEA is used for global/data addresses.
-                 // Check for overflow during address calculation.
-                 // Assume BP is a valid word index because ENT/LEV manage it
-                 let base = self.bp as i64; // Use i64 to prevent intermediate overflow
-                 let offset64 = offset as i64;
-                 let calculated_addr64 = base.checked_add(offset64).ok_or_else(|| VmError::ArithmeticError("LEA address calculation overflow".to_string()))?;
+            // --- Memory Access (Using Byte Addresses) ---
+            Instruction::Lea => { // Load Effective Address: Calculates address -> AX
+                let offset_words = self.fetch_operand()?; // Assume offset is in words relative to BP
 
-                 // Should the result be validated against memory bounds? LEA itself usually doesn't fail.
-                 // The *use* of the address (LI, SI) will fail if invalid.
-                 // Convert back to Value (i32) - potential truncation if i64 was needed
-                 if calculated_addr64 < (Value::MIN as i64) || calculated_addr64 > (Value::MAX as i64) {
+                // BP is a word index. Calculate target word index.
+                 let base_word_addr = self.bp as i64; // Use i64 for intermediate calculation
+                 let target_word_addr_i64 = base_word_addr.checked_add(offset_words as i64).ok_or_else(|| VmError::ArithmeticError("LEA word address calculation overflow".to_string()))?;
+
+                 // Convert target word address to target byte address
+                 let target_byte_addr_i64 = target_word_addr_i64.checked_mul(VALUE_SIZE_BYTES as i64).ok_or_else(|| VmError::ArithmeticError("LEA byte address calculation overflow".to_string()))?;
+
+                 // Check if the result fits in Value (i32)
+                 if target_byte_addr_i64 < (Value::MIN as i64) || target_byte_addr_i64 > (Value::MAX as i64) {
                      return Err(VmError::ArithmeticError("LEA result out of Value range".to_string()));
                  }
-                 self.ax = calculated_addr64 as Value;
+
+                 // LEA calculates the address; it doesn't access memory itself.
+                 // The calculated address might be out of bounds, but that's okay here.
+                 // Subsequent LI/SI/LC/SC will fail if the address is invalid.
+                 self.ax = target_byte_addr_i64 as Value;
             }
-            Instruction::Li => { // Load Integer (from word address in AX)
-                let addr = self.validate_mem_word_addr(self.ax, "LI")?;
-                self.ax = self.memory[addr];
+            Instruction::Li => { // Load Integer (from BYTE address in AX) -> AX
+                let byte_addr_val = self.ax;
+                let start_byte = self.validate_byte_access(byte_addr_val, VALUE_SIZE_BYTES, "LI")?;
+
+                // Read VALUE_SIZE_BYTES bytes starting from start_byte
+                let mut bytes = [0u8; VALUE_SIZE_BYTES];
+                for i in 0..VALUE_SIZE_BYTES {
+                    // Reading bytes individually handles potential unaligned access across words
+                    bytes[i] = self.get_mem_byte((byte_addr_val as i64 + i as i64) as Value, "LI byte read")?;
+                }
+                self.ax = Value::from_le_bytes(bytes); // Reconstruct from little-endian bytes
             }
-            Instruction::Lc => { // Load Character (from byte address in AX)
-                let byte_val = self.get_mem_byte(self.ax, "LC")?;
+            Instruction::Lc => { // Load Character (from BYTE address in AX) -> AX
+                let byte_addr_val = self.ax;
+                let byte_val = self.get_mem_byte(byte_addr_val, "LC")?;
                 self.ax = byte_val as Value; // Zero-extend char to Value
             }
-            Instruction::Si => { // Store Integer (AX into word address from stack)
-                 let addr_val = self.pop()?;
-                 let addr = self.validate_mem_word_addr(addr_val, "SI")?;
-                 self.memory[addr] = self.ax;
+            Instruction::Si => { // Store Integer (AX into BYTE address from stack)
+                 let byte_addr_val = self.pop()?;
+                 let start_byte = self.validate_byte_access(byte_addr_val, VALUE_SIZE_BYTES, "SI")?;
+
+                 let bytes_to_write = self.ax.to_le_bytes();
+                 for i in 0..VALUE_SIZE_BYTES {
+                     // Writing bytes individually handles potential unaligned access across words
+                     self.set_mem_byte((byte_addr_val as i64 + i as i64) as Value, bytes_to_write[i], "SI byte write")?;
+                 }
             }
-            Instruction::Sc => { // Store Character (AX low byte into byte address from stack)
-                 let addr_val = self.pop()?;
-                 // Address needs validation *before* potential access
+            Instruction::Sc => { // Store Character (AX low byte into BYTE address from stack)
+                 let byte_addr_val = self.pop()?;
                  let byte_to_store = (self.ax & 0xFF) as u8;
-                 self.set_mem_byte(addr_val, byte_to_store, "SC")?;
+                 self.set_mem_byte(byte_addr_val, byte_to_store, "SC")?;
             }
 
-            // --- Syscalls ---
-            // Note: These syscalls assume arguments are pushed in C order (last arg pushed first)
-            // Stack before syscall: [..., argN, ..., arg2, arg1] -> pops arg1, arg2, ...
-            Instruction::Open => { // open(pathname, flags) -> fd ; Stack: [..., pathname_addr, flags]
+            // --- Syscalls --- (Arguments assumed pushed R->L: [..., argN, ..., arg1] <- SP)
+            Instruction::Open => { // open(pathname_addr, flags) -> fd ; Stack: [..., pathname_addr, flags]
                 let flags = self.pop()?;
                 let pathname_addr = self.pop()?;
-                // Assume pathname is in general 'Memory' (stack/heap/global mapped area)
-                let pathname_c = self.read_c_string(pathname_addr, 1024, "Memory")?;
-
-                // Use libc::open (careful with flags interpretation if different from host OS)
-                // For basic C4, direct mapping might be okay.
+                let pathname_c = self.read_c_string(pathname_addr, 1024, "OPEN pathname")?;
                 self.ax = unsafe { libc::open(pathname_c.as_ptr(), flags as libc::c_int) };
-                // Check for errors? libc::open returns -1 on error.
-                // if self.ax == -1 { Err(VmError::IoError(format!("open failed for '{}'", pathname_c.to_string_lossy())))? }
+                // Optional: Check self.ax == -1 and map to VmError::IoError
             }
             Instruction::Read => { // read(fd, buf_addr, count) -> bytes_read ; Stack: [..., fd, buf_addr, count]
                 let count_val = self.pop()?;
@@ -614,60 +619,64 @@ impl VirtualMachine {
                 let fd = self.pop()?;
 
                 if fd < 0 { return Err(VmError::InvalidFileDescriptor(fd)); }
-                if count_val < 0 { return Err(VmError::ArithmeticError(format!("READ count cannot be negative: {}", count_val))); }
                 if buf_addr == 0 { return Err(VmError::NullPointerAccess("READ buffer".to_string())); }
+                 // Allow count == 0,libc::read handles it (returns 0)
 
-                let count = count_val as usize; // Convert to usize for slice index and libc call
+                // get_memory_slice_mut validates buf_addr and count
                 let buf_slice = self.get_memory_slice_mut(buf_addr, count_val, "READ")?;
 
-                let bytes_read = unsafe {
-                    libc::read(fd, buf_slice.as_mut_ptr() as *mut libc::c_void, count.try_into().unwrap())
-                };
-                 // Returns bytes read (>=0) on success, -1 on error
-                 self.ax = bytes_read as Value;
-                 // if self.ax == -1 { Err(VmError::IoError("read failed".to_string()))? }
+                // Handle negative count after getting slice (which requires non-negative count)
+                if count_val < 0 {
+                     // POSIX read with negative count is undefined behavior/error.
+                     // Set errno? Return -1? Let's return -1.
+                     self.ax = -1;
+                     // Maybe set an OS error number via a helper?
+                } else if count_val == 0 {
+                    self.ax = 0; // Read 0 bytes
+                }
+                else {
+                    let bytes_read = unsafe {
+                        libc::read(fd, buf_slice.as_mut_ptr() as *mut libc::c_void, buf_slice.len().try_into().unwrap()) // Use slice len
+                    };
+                    self.ax = bytes_read as Value; // bytes_read is isize, cast to i32
+                    // Optional: Check self.ax == -1 and map to VmError::IoError
+                }
             }
             Instruction::Clos => { // close(fd) -> 0 or -1 ; Stack: [..., fd]
                 let fd = self.pop()?;
                 if fd < 0 { return Err(VmError::InvalidFileDescriptor(fd)); }
                 self.ax = unsafe { libc::close(fd) };
-                 // Returns 0 on success, -1 on error
-                 // if self.ax == -1 { Err(VmError::IoError("close failed".to_string()))? }
+                 // Optional: Check self.ax == -1 and map to VmError::IoError
             }
-            Instruction::Prtf => { // printf(format_addr, arg1, arg2, ...) -> count
-                // Stack: [..., format_addr, arg1, arg2, ...]
-                // Arguments are popped inside the handler in reverse order they appear on stack
-                self.handle_printf()?;
+            Instruction::Prtf => { // printf(format_addr, ...) -> count
+                self.handle_printf()?; // Uses unified memory via read_c_string
             }
-            Instruction::Malc => { // malloc(size) -> ptr ; Stack: [..., size]
-                let size_bytes = self.pop()?;
-                if size_bytes <= 0 {
-                    self.ax = 0; // malloc(0) or malloc(<0) returns NULL
+            Instruction::Malc => { // malloc(size_bytes) -> ptr ; Stack: [..., size_bytes]
+                let size_bytes_val = self.pop()?;
+                if size_bytes_val <= 0 {
+                    self.ax = 0; // malloc(0) or malloc(<0) returns NULL (or implementation defined ptr)
                 } else {
-                    // Simulate allocation from heap_ptr
-                    // Word alignment: C malloc guarantees alignment suitable for any fundamental type.
-                    // For simplicity, let's align to word boundary (size_of::<Value>).
-                    let size_bytes_usize = size_bytes as usize;
-                    let required_bytes_aligned = (size_bytes_usize + std::mem::size_of::<Value>() - 1) & !(std::mem::size_of::<Value>() - 1);
-                    let required_words = required_bytes_aligned / std::mem::size_of::<Value>();
+                    let size_bytes_usize = size_bytes_val as usize;
+                    // Align size up to word boundary for simplicity, although C malloc has stricter alignment guarantees.
+                    let required_bytes_aligned = (size_bytes_usize + VALUE_SIZE_BYTES - 1) & !(VALUE_SIZE_BYTES - 1);
+                    let required_words = required_bytes_aligned / VALUE_SIZE_BYTES;
 
-                    let new_heap_ptr = self.heap_ptr.checked_add(required_words);
+                    let next_heap_ptr = self.heap_ptr.checked_add(required_words);
 
-                    match new_heap_ptr {
+                    match next_heap_ptr {
                          // Check collision with stack pointer (heap grows up, stack grows down)
-                         Some(next_hp) if next_hp <= self.sp => { // Use <= because SP points to the *next* free slot when growing down
-                             let alloc_addr_bytes = self.heap_ptr * std::mem::size_of::<Value>();
+                         // Collision if next_heap_ptr would reach or exceed current sp
+                         Some(next_hp) if next_hp <= self.sp => {
+                             let alloc_start_word = self.heap_ptr;
+                             let alloc_addr_bytes = alloc_start_word * VALUE_SIZE_BYTES;
                              self.ax = alloc_addr_bytes as Value; // Return byte address of allocation start
-                             self.heap_ptr = next_hp; // Update heap pointer
+                             self.heap_ptr = next_hp; // Update heap pointer *after* calculating return address
 
-                             // Optional: Zero out allocated memory? C malloc doesn't guarantee this.
-                             // let alloc_slice = self.get_memory_slice_mut(self.ax, required_bytes_aligned as Value, "MALLOC zeroing")?;
-                             // alloc_slice.fill(0);
-
+                             // Optional: Zero out allocated memory (like calloc)? C malloc doesn't.
                          }
                          _ => { // Heap overflow (collision or usize overflow)
                             self.ax = 0; // C returns NULL (0) on failure
-                            // Optionally return VmError::HeapOverflow instead, but C programs expect NULL
+                            // Optionally return VmError::HeapOverflow, but C programs expect NULL
                             // return Err(VmError::HeapOverflow);
                          }
                     }
@@ -675,24 +684,25 @@ impl VirtualMachine {
             }
             Instruction::Free => { // free(ptr) -> void ; Stack: [..., ptr]
                 let _ptr = self.pop()?; // Pop pointer from stack
-                // Our bump allocator doesn't support freeing individual blocks. No-op.
-                self.ax = 0; // free has no return value, but set AX to 0 for predictability
+                // Our simple bump allocator doesn't support freeing individual blocks. This is a No-Op.
+                self.ax = 0; // free has no return value, set AX to 0.
             }
             Instruction::Mset => { // memset(dest_addr, char_val, count) -> dest_addr ; Stack: [..., dest_addr, char_val, count]
                  let count_val = self.pop()?;
                  let char_val = self.pop()?; // Value containing the byte in its lower 8 bits
                  let dest_addr = self.pop()?;
 
-                 if count_val < 0 { return Err(VmError::ArithmeticError(format!("MSET count cannot be negative: {}", count_val))); }
                  if dest_addr == 0 { return Err(VmError::NullPointerAccess("MSET destination".to_string())); }
-                 // A count of 0 is valid, should do nothing and return dest_addr
+                 // Allow count == 0, should do nothing and return dest_addr
 
+                 // get_memory_slice_mut handles validation of dest_addr and count
+                 let dest_slice = self.get_memory_slice_mut(dest_addr, count_val, "MSET")?;
+
+                 // Check count after slice aquisition (get_memory_slice_mut checks >= 0)
                  if count_val > 0 {
-                    let dest_slice = self.get_memory_slice_mut(dest_addr, count_val, "MSET")?;
                     let byte_to_set = (char_val & 0xFF) as u8;
                     dest_slice.fill(byte_to_set);
                  }
-
                  self.ax = dest_addr; // memset returns the destination pointer
             }
             Instruction::Mcmp => { // memcmp(addr1, addr2, count) -> comparison_result ; Stack: [..., addr1, addr2, count]
@@ -700,30 +710,38 @@ impl VirtualMachine {
                  let addr2 = self.pop()?;
                  let addr1 = self.pop()?;
 
-                 if count_val < 0 { return Err(VmError::ArithmeticError(format!("MCMP count cannot be negative: {}", count_val))); }
                  if addr1 == 0 { return Err(VmError::NullPointerAccess("MCMP address 1".to_string())); }
                  if addr2 == 0 { return Err(VmError::NullPointerAccess("MCMP address 2".to_string())); }
-                 // A count of 0 is valid, should return 0
+                 // Allow count == 0, should return 0
 
-                 let count = count_val as usize;
-                 let mut result: Value = 0;
+                if count_val < 0 {
+                    // Undefined behavior in C? Let's return 0, similar to count == 0.
+                    self.ax = 0;
+                } else if count_val == 0 {
+                    self.ax = 0;
+                }
+                 else {
+                    let count = count_val as usize;
+                    let mut result: Value = 0;
 
-                 // Avoid slice borrowing issues by reading bytes directly
-                 for i in 0..count {
-                    // Calculate addresses for each byte carefully, checking for overflow
-                    let current_addr1 = addr1.checked_add(i as Value).ok_or_else(|| VmError::ArithmeticError("MCMP address 1 overflow".to_string()))?;
-                    let current_addr2 = addr2.checked_add(i as Value).ok_or_else(|| VmError::ArithmeticError("MCMP address 2 overflow".to_string()))?;
+                    // Avoid slice borrowing issues by reading bytes directly
+                    for i in 0..count {
+                        // Calculate addresses for each byte carefully, checking for overflow
+                        let current_addr1 = addr1.checked_add(i as Value).ok_or_else(|| VmError::ArithmeticError("MCMP address 1 overflow".to_string()))?;
+                        let current_addr2 = addr2.checked_add(i as Value).ok_or_else(|| VmError::ArithmeticError("MCMP address 2 overflow".to_string()))?;
 
-                    let byte1 = self.get_mem_byte(current_addr1, "MCMP byte1")?;
-                    let byte2 = self.get_mem_byte(current_addr2, "MCMP byte2")?;
+                        // Use get_mem_byte which handles bounds checking per byte
+                        let byte1 = self.get_mem_byte(current_addr1, "MCMP byte1")?;
+                        let byte2 = self.get_mem_byte(current_addr2, "MCMP byte2")?;
 
-                    if byte1 != byte2 {
-                        // C memcmp returns difference between the first differing *unsigned chars*
-                        result = (byte1 as Value) - (byte2 as Value);
-                        break;
+                        if byte1 != byte2 {
+                            // C memcmp returns difference between the first differing *unsigned chars*
+                            result = (byte1 as Value) - (byte2 as Value);
+                            break;
+                        }
                     }
+                    self.ax = result; // 0 if equal, <0 if s1<s2, >0 if s1>s2
                  }
-                 self.ax = result; // 0 if equal, <0 if s1<s2, >0 if s1>s2
             }
 
         } // end match instruction
@@ -732,91 +750,63 @@ impl VirtualMachine {
 
     /// Handles the printf logic (separated for clarity)
     /// Assumes arguments are on the stack [..., format_addr, argN, ..., arg1]
-    /// Pops arguments as needed.
+    /// Pops arguments as needed. Uses unified memory via read_c_string.
     fn handle_printf(&mut self) -> Result<(), VmError> {
-         // 1. Get format string address (last argument pushed, so first one accessible conceptually)
-         // BUT, printf needs it first. It's on top relative to args, but deep relative to current SP.
-         // The C calling convention puts args on stack, then calls. The format addr is usually passed like other args.
-         // Let's assume BP points to the frame: [ret addr][old bp][local0]..[arg0][arg1]...[argN]
-         // C4 spec might clarify exact layout. Assuming args are accessible relative to BP or SP *before* printf call setup.
-         // A simpler VM might assume args are just pushed before CALL/syscall: [argN]...[arg1][format_addr] <- SP before Prtf instruction
-         // Let's stick to the simple stack model: pop format_addr first.
-         let str_addr_val = self.pop()?; // Pop format string address
+         // Pop format string address first (was pushed last by caller, conceptually)
+         let format_addr_val = self.pop()?;
 
-         // Where is the format string? Could be data segment (constants) or memory (dynamic).
-         // Let's try data segment first, then memory if that fails or address seems too high.
-         // This is heuristic and might be wrong for edge cases.
-         let format_c_str = self.read_c_string(str_addr_val, 1024, "Data Segment")
-              .or_else(|_| self.read_c_string(str_addr_val, 1024, "Memory")) // Try memory if data segment fails
-              .map_err(|e| VmError::CStringError(format!("Failed to read printf format string at 0x{:X}: {}", str_addr_val, e)))?; // Combine errors
-
+         // Read format string from unified memory
+         let format_c_str = self.read_c_string(format_addr_val, 1024, "printf format string")?;
          let format_str = format_c_str.to_str()
              .map_err(|e| VmError::CStringError(format!("Invalid UTF-8 in printf format string: {}", e)))?;
 
-         // 2. Process format string, popping actual arguments from stack as needed.
+         // Process format string, popping actual arguments from stack as needed.
          let mut chars_iter = format_str.chars().peekable();
-         let mut output_buffer = String::new(); // Buffer output to print once
-         let mut chars_printed_count = 0;
+         let mut output_buffer = String::new(); // Buffer output
 
          while let Some(c) = chars_iter.next() {
              if c == '%' {
                  match chars_iter.next() {
-                     Some('d') => {
-                         let arg_int_value = self.pop()?; // Pop integer argument
-                         let formatted_arg = arg_int_value.to_string();
-                         output_buffer.push_str(&formatted_arg);
-                         chars_printed_count += formatted_arg.len();
+                     Some('d') => { // Integer
+                         let arg_int_value = self.pop()?;
+                         output_buffer.push_str(&arg_int_value.to_string());
                      }
-                     Some('c') => { // Handle %c for characters
-                         let arg_char_value = self.pop()?; // Pop character argument (as int)
-                         // Ensure it's a valid char before push
+                     Some('c') => { // Character
+                         let arg_char_value = self.pop()?;
                          if let Some(ch) = std::char::from_u32((arg_char_value & 0xFF) as u32) {
                             output_buffer.push(ch);
-                            chars_printed_count += 1;
                          } else {
-                            // Handle invalid char? Print replacement char? Error?
-                            output_buffer.push('?'); // Replace invalid byte with '?'
-                            chars_printed_count += 1;
+                            output_buffer.push('?'); // Invalid char replacement
                          }
                      }
-                     Some('s') => { // Handle %s for strings
-                         let arg_str_addr = self.pop()?; // Pop string address (byte address)
-                         // Assume string is in Memory (stack/heap) for %s arguments
-                         // Could potentially be in Data Segment too. Add similar fallback?
-                         let arg_c_str = self.read_c_string(arg_str_addr, 4096, "Memory")
-                             .map_err(|e| VmError::CStringError(format!("Failed reading %%s arg at 0x{:X}: {}", arg_str_addr, e)))?;
-                         // Convert CString to Rust string slice (&str) lossily if needed
-                         let arg_str = String::from_utf8_lossy(arg_c_str.to_bytes());
-                         output_buffer.push_str(&arg_str);
-                         chars_printed_count += arg_str.len(); // Count bytes or chars? C printf counts bytes. Use len().
+                     Some('s') => { // String
+                         let arg_str_addr = self.pop()?;
+                         // Read string argument from unified memory
+                         let arg_c_str = self.read_c_string(arg_str_addr, 4096, "printf %s argument")?;
+                         output_buffer.push_str(&String::from_utf8_lossy(arg_c_str.to_bytes()));
                      }
-                     Some('%') => {
+                     Some('%') => { // Literal '%'
                          output_buffer.push('%');
-                         chars_printed_count += 1;
                      }
-                     Some(other) => { // Unrecognized or unsupported specifier - print literally
-                          output_buffer.push('%'); output_buffer.push(other); chars_printed_count += 2;
+                     Some(other) => { // Unrecognized specifier - print literally
+                          output_buffer.push('%'); output_buffer.push(other);
                      }
                      None => { // String ends with '%'
-                          output_buffer.push('%'); chars_printed_count += 1;
+                          output_buffer.push('%');
                      }
                  }
              } else {
                  output_buffer.push(c);
-                 chars_printed_count += 1; // Count chars or bytes? Assume bytes for C compatibility. This counts chars. Let's adjust.
-                 // Correction: C printf counts bytes written. Need len_utf8.
-                 // Let's recalculate count at the end based on the final string bytes.
              }
          }
 
-         // 3. Print the composed string (using Rust's print!)
-         // Use print! which goes to stdout, respecting locking
+         // Print the composed string
          print!("{}", output_buffer);
          use std::io::{self, Write};
-         io::stdout().flush().map_err(|e| VmError::IoError(format!("stdout flush failed: {}", e)))?; // Ensure output is visible
+         io::stdout().flush().map_err(|e| VmError::IoError(format!("stdout flush failed: {}", e)))?;
 
-         // 4. Set return value in AX (number of bytes printed) - Recalculate based on bytes
-         self.ax = output_buffer.len() as Value; // Use byte length of the final string
+         // Set return value in AX (number of bytes printed)
+         self.ax = output_buffer.len() as Value; // C printf returns bytes written
          Ok(())
     }
 
@@ -825,89 +815,112 @@ impl VirtualMachine {
      #[allow(dead_code)]
     pub fn dump_registers(&self) {
         println!("--- Registers ---");
-        println!("  PC: 0x{:08X} ({})", self.pc, self.pc);
-        println!("  SP: 0x{:08X} ({})", self.sp, self.sp);
-        println!("  BP: 0x{:08X} ({})", self.bp, self.bp);
+        println!("  PC: 0x{:08X} ({}) [Code Index]", self.pc, self.pc);
+        println!("  SP: 0x{:08X} ({}) [Mem Word Index]", self.sp, self.sp);
+        println!("  BP: 0x{:08X} ({}) [Mem Word Index]", self.bp, self.bp);
         println!("  AX: 0x{:08X} ({})", self.ax, self.ax);
-        println!("  HP: 0x{:08X} ({})", self.heap_ptr, self.heap_ptr); // Heap pointer (word index)
+        println!("  HP: 0x{:08X} ({}) [Mem Word Index]", self.heap_ptr, self.heap_ptr);
         println!("-----------------");
     }
 
     #[allow(dead_code)]
     pub fn dump_stack(&self, count: usize) {
-        println!("--- Stack Top (max {} entries, SP -> 0x{:X}) ---", count, self.sp);
-        // FIX: Add type annotation for `start`
-        let start: usize = self.sp;
-        // Calculate end bound safely, ensuring it doesn't wrap or exceed memory size
-        let end = start.saturating_add(count).min(self.memory_size_words);
+        println!("--- Stack Top (max {} words, SP word idx -> 0x{:X}) ---", count, self.sp);
+        let start_word_idx: usize = self.sp; // SP points to the next free slot (lower addr)
+        let end_word_idx = start_word_idx.saturating_add(count).min(self.memory_size_words);
 
-        if start >= self.memory_size_words {
-            println!("  (SP 0x{:X} points outside memory 0x{:X})", start, self.memory_size_words);
-        } else if start >= end && count > 0 {
-             println!("  (SP 0x{:X} is at or near end 0x{:X}, nothing to show for count {})", start, end, count);
+        if start_word_idx >= self.memory_size_words {
+            println!("  (SP 0x{:X} points at or past end of memory 0x{:X})", start_word_idx, self.memory_size_words);
+        } else if start_word_idx >= end_word_idx && count > 0 {
+             println!("  (SP 0x{:X} is at or near end 0x{:X}, nothing to show)", start_word_idx, end_word_idx);
         } else if count == 0 {
              println!("  (Count is zero)");
         } else {
-            // Iterate from SP upwards towards higher addresses (lower in memory)
-            for i in start..end {
-                 // Check if index `i` is valid *within the loop* just in case `end` calculation was off
+            // Iterate from SP upwards towards higher indices (conceptually lower stack slots)
+            for i in start_word_idx..end_word_idx {
+                 // Bounds check just in case
                  if i < self.memory.len() {
-                     println!("  [Mem Idx 0x{:X}] 0x{:08X} ({})", i, self.memory[i], self.memory[i]);
+                     let byte_addr = i * VALUE_SIZE_BYTES;
+                     println!("  [Mem Word 0x{:X} / Byte 0x{:X}] 0x{:08X} ({})", i, byte_addr, self.memory[i], self.memory[i]);
                  } else {
-                     println!("  [Mem Idx 0x{:X}] (Out of bounds!)", i);
-                     break; // Stop if we somehow go out of bounds
+                     println!("  [Mem Word 0x{:X}] (Out of bounds!)", i);
+                     break;
                  }
             }
         }
         println!("------------------------------------------");
     }
 
-     #[allow(dead_code)]
-     pub fn dump_data_segment(&self) {
-         println!("--- Data Segment ({} bytes) ---", self.data_segment.len());
-         const BYTES_PER_LINE: usize = 16;
-         if self.data_segment.is_empty() {
-             println!("  (Empty)");
-         } else {
-            for (i, chunk) in self.data_segment.chunks(BYTES_PER_LINE).enumerate() {
-                print!("  {:04X}: ", i * BYTES_PER_LINE);
-                for byte in chunk { print!("{:02X} ", byte); }
-                // Pad line if it's shorter than BYTES_PER_LINE
-                if chunk.len() < BYTES_PER_LINE { for _ in 0..(BYTES_PER_LINE - chunk.len()) { print!("   "); } }
-                print!(" |");
-                for byte in chunk {
-                    // Print printable ASCII chars, otherwise '.'
-                    print!("{}", if *byte >= 32 && *byte <= 126 { *byte as char } else { '.' });
-                }
-                println!("|");
-            }
-         }
-         println!("----------------------------");
-     }
+     // Removed: dump_data_segment
 
       #[allow(dead_code)]
      pub fn dump_heap(&self, count: usize) {
-         println!("--- Heap Start (max {} words, HP -> 0x{:X}) ---", count, self.heap_ptr);
-         let start_word: usize = 0;
-         // Show words from index 0 up to `count` or `heap_ptr`, whichever is smaller
-         let end_word = start_word.saturating_add(count).min(self.heap_ptr);
+         // Dumps from start of heap (word index 0 or after data) up to heap_ptr or count words
+         println!("--- Heap Start (max {} words, HP word idx -> 0x{:X}) ---", count, self.heap_ptr);
+         // Figure out where the static data ended and heap potentially began
+         // For simplicity, let's just dump from word index 0 up to min(count, heap_ptr)
+         // A more accurate dump would need the exact size of the initial data copied.
+         let start_word_idx: usize = 0; // Start from memory beginning
+         let end_word_idx = start_word_idx.saturating_add(count).min(self.heap_ptr); // Show up to count words or current heap ptr
 
-         if start_word >= end_word && count > 0 {
-             println!("  (Heap Empty or HP=0)");
+         if self.heap_ptr == 0 {
+            println!("  (Heap pointer is at 0, likely empty or only static data exists)");
+         } else if start_word_idx >= end_word_idx && count > 0 {
+             println!("  (Heap Empty or HP <= start index 0)");
          } else if count == 0 {
             println!("  (Count is zero)");
          } else {
-            for i in start_word..end_word {
-                // Check index validity just in case
-                if i < self.memory.len() {
-                    println!("  [Mem Idx 0x{:X}] 0x{:08X} ({})", i, self.memory[i], self.memory[i]);
+            for i in start_word_idx..end_word_idx {
+                if i < self.memory.len() { // Bounds check
+                     let byte_addr = i * VALUE_SIZE_BYTES;
+                     println!("  [Mem Word 0x{:X} / Byte 0x{:X}] 0x{:08X} ({})", i, byte_addr, self.memory[i], self.memory[i]);
                 } else {
-                     println!("  [Mem Idx 0x{:X}] (Out of bounds!)", i);
+                     println!("  [Mem Word 0x{:X}] (Out of bounds!)", i);
                      break;
                 }
             }
          }
          println!("-----------------------------------------");
      }
+
+    /// Dumps a specific section of the unified memory.
+    /// `start_word_addr`: The starting word index.
+    /// `num_words`: The number of words to dump.
+    #[allow(dead_code)]
+    pub fn dump_memory_section(&self, start_word_addr: usize, num_words: usize) -> Result<(), VmError> {
+        println!("--- Memory Section Dump (Start Word: 0x{:X}, Count: {}) ---", start_word_addr, num_words);
+
+        if num_words == 0 {
+            println!("  (Count is zero)");
+            println!("---------------------------------------------------------");
+            return Ok(());
+        }
+
+        let end_word_addr = start_word_addr.checked_add(num_words).ok_or_else(|| VmError::ArithmeticError("Address overflow calculating dump end".to_string()))?;
+
+        // Validate range against total memory size in words
+        if start_word_addr >= self.memory_size_words {
+             println!("  (Start address 0x{:X} is out of bounds [0x0 - 0x{:X}])", start_word_addr, self.memory_size_words);
+             println!("---------------------------------------------------------");
+            return Err(VmError::MemoryAccessOutOfBounds { address: (start_word_addr * VALUE_SIZE_BYTES) as Value, size: num_words * VALUE_SIZE_BYTES, op_name: "dump_memory_section".to_string() });
+        }
+
+        // Adjust end address if it goes past the end of memory
+        let effective_end_word_addr = end_word_addr.min(self.memory_size_words);
+
+         if start_word_addr >= effective_end_word_addr {
+             println!("  (Calculated end address 0x{:X} is not after start address 0x{:X})", effective_end_word_addr, start_word_addr);
+         } else {
+            for i in start_word_addr..effective_end_word_addr {
+                 // Direct index access is safe due to range checks above
+                 let value = self.memory[i];
+                 let byte_addr = i * VALUE_SIZE_BYTES;
+                 println!("  [Mem Word 0x{:06X} / Byte 0x{:08X}] 0x{:08X} ({})", i, byte_addr, value, value);
+            }
+         }
+
+        println!("---------------------------------------------------------");
+        Ok(())
+    }
 
 } // impl VirtualMachine

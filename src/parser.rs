@@ -4,9 +4,14 @@
 // NOTE: Ensure you have added `#[derive(Clone)]` to your Lexer struct definition in lexer.rs!
 use crate::lexer::{Lexer, Token, TokenInfo, LexerError};
 use crate::symbol::{SymbolTable, SymbolClass, DataType};
-use crate::vm::{Instruction, Value}; // Assuming TryFrom<Value> for Instruction is defined HERE
+// Make sure Instruction has TryFrom implemented and is accessible
+// e.g., use crate::vm::{Instruction, Value, VmError}; // if TryFrom returns VmError
+use crate::vm::{Instruction, Value, VALUE_SIZE_BYTES}; // Assuming TryFrom<Value> for Instruction is defined HERE
 use std::iter::Peekable;
 use std::mem; // Needed for mem::swap
+
+// Define word size based on the VM's Value type (assuming i32 or i64)
+const WORD_SIZE: usize = std::mem::size_of::<Value>();
 
 // --- Operator Precedence Levels (Higher value = higher precedence) ---
 // Matches C4's implicit levels used in expr()
@@ -117,20 +122,23 @@ pub struct Parser<'a> {
     ent_patch_location: Option<usize>,
 }
 
-// Define constant for built-ins if not already defined globally
-// Use a distinct value if needed, -1 is common but ensure it doesn't clash
-const PRINTF_SYSCALL_ADDR: i64 = -1;
-// Add others as needed:
-// const MALLOC_SYSCALL_ADDR: i64 = -2;
-// const FREE_SYSCALL_ADDR:   i64 = -3;
-// ...
+// Assume system call opcodes are defined somewhere, maybe in vm.rs or a global consts mod
+// These are PLACEHOLDERS - use the actual opcodes from your VM
+const PRINTF_OPCODE: i64 = 37; // Example Prtf
+const OPEN_OPCODE:   i64 = 30; // Example Open
+const READ_OPCODE:   i64 = 31; // Example Read
+const CLOSE_OPCODE:  i64 = 32; // Example Clos
+const MALLOC_OPCODE: i64 = 33; // Example Malc
+const FREE_OPCODE:   i64 = 34; // Example Free
+const MEMSET_OPCODE: i64 = 35; // Example Mset
+const MEMCMP_OPCODE: i64 = 36; // Example Mcmp
+const EXIT_OPCODE:   i64 = 1;  // Example Exit
 
 impl<'a> Parser<'a> {
     pub fn new(lexer: Lexer<'a>) -> Self {
         let mut symbol_table = SymbolTable::new();
 
-        // --- Add built-in keywords and functions ---
-        // Keywords (simplifies checking later)
+        // --- Add built-in keywords ---
         symbol_table.add_reserved("char", Token::Char).unwrap();
         symbol_table.add_reserved("else", Token::Else).unwrap();
         symbol_table.add_reserved("enum", Token::Enum).unwrap();
@@ -139,26 +147,35 @@ impl<'a> Parser<'a> {
         symbol_table.add_reserved("return", Token::Return).unwrap();
         symbol_table.add_reserved("sizeof", Token::Sizeof).unwrap();
         symbol_table.add_reserved("while", Token::While).unwrap();
-        symbol_table.add_reserved("void", Token::Void).unwrap(); // Add void if it's a token
+        symbol_table.add_reserved("void", Token::Void).unwrap();
 
-        // Built-in functions (using Sys class)
-        // Need to define their VM opcodes or syscall numbers in vm.rs or globally
-        symbol_table.add(
-            "printf".to_string(), Token::Sys, SymbolClass::Sys, DataType::Int, PRINTF_SYSCALL_ADDR
-        ).expect("Failed to add built-in printf");
-        // Add others like open, read, close, malloc, free, memset, memcmp, exit here
-        // Example:
-        // symbol_table.add("malloc".to_string(), Token::Sys, SymbolClass::Sys, DataType::Ptr(Box::new(DataType::Void)), MALLOC_SYSCALL_ADDR).unwrap();
-        // symbol_table.add("exit".to_string(), Token::Sys, SymbolClass::Sys, DataType::Void, EXIT_SYSCALL_ADDR).unwrap();
+        // --- Add built-in functions (Syscalls) ---
+        // Ensure all 5 arguments are provided to `add`:
+        // name: String, token: Token, class: SymbolClass, data_type: DataType, value: i64
+        // Use the correct Instruction opcodes from vm.rs
+        symbol_table.add("printf".to_string(), Token::Sys, SymbolClass::Sys, DataType::Int, Instruction::Prtf as i64).expect("Failed to add built-in printf");
+        symbol_table.add("open".to_string(), Token::Sys, SymbolClass::Sys, DataType::Int, Instruction::Open as i64).expect("Failed to add built-in open");
+        symbol_table.add("read".to_string(), Token::Sys, SymbolClass::Sys, DataType::Int, Instruction::Read as i64).expect("Failed to add built-in read"); // ssize_t -> Int
+        symbol_table.add("close".to_string(), Token::Sys, SymbolClass::Sys, DataType::Int, Instruction::Clos as i64).expect("Failed to add built-in close");
+        symbol_table.add("malloc".to_string(), Token::Sys, SymbolClass::Sys, DataType::Ptr(Box::new(DataType::Void)), Instruction::Malc as i64).expect("Failed to add built-in malloc");
+        symbol_table.add("free".to_string(), Token::Sys, SymbolClass::Sys, DataType::Void, Instruction::Free as i64).expect("Failed to add built-in free");
+        symbol_table.add("memset".to_string(), Token::Sys, SymbolClass::Sys, DataType::Ptr(Box::new(DataType::Void)), Instruction::Mset as i64).expect("Failed to add built-in memset"); // Returns ptr
+        symbol_table.add("memcmp".to_string(), Token::Sys, SymbolClass::Sys, DataType::Int, Instruction::Mcmp as i64).expect("Failed to add built-in memcmp");
+        symbol_table.add("exit".to_string(), Token::Sys, SymbolClass::Sys, DataType::Void, Instruction::Exit as i64).expect("Failed to add built-in exit"); // Use VM Exit opcode value
+
+
+        // --- Initialize data_segment WITH PADDING ---
+        let initial_padding_size = VALUE_SIZE_BYTES; // Use size from vm.rs
+        let initial_data_segment = vec![0u8; initial_padding_size];
 
 
         Parser {
             tokens: lexer.peekable(),
             symbol_table,
             code: Vec::new(),
-            data_segment: Vec::new(),
+            data_segment: initial_data_segment, // Starts with padding
             current_token_info: None,
-            current_bp_offset: 0, // Reset for each function
+            current_bp_offset: 0,
             ent_patch_location: None,
         }
     }
@@ -168,6 +185,7 @@ impl<'a> Parser<'a> {
     fn next_token(&mut self) -> ParseResult<TokenInfo> {
          match self.tokens.next() {
             Some(Ok(token_info)) => {
+                // Keep track of the *last successfully consumed* token's info
                 self.current_token_info = Some(token_info.clone());
                 Ok(token_info)
             }
@@ -185,6 +203,7 @@ impl<'a> Parser<'a> {
      }
     #[inline]
     fn current_pos(&self) -> (usize, usize) {
+        // Use the stored last consumed token's position
         self.current_token_info.as_ref().map_or((0, 0), |ti| (ti.line, ti.column))
     }
     #[inline]
@@ -231,17 +250,41 @@ impl<'a> Parser<'a> {
     #[inline] fn emit(&mut self, instruction: Instruction) { self.code.push(instruction as Value); }
     #[inline] fn emit_with_operand(&mut self, instruction: Instruction, operand: Value) { self.emit(instruction); self.code.push(operand); }
     #[inline] fn current_code_addr(&self) -> usize { self.code.len() }
+
+    // Helper to calculate padding needed to reach alignment
     #[inline]
-    fn add_string_literal(&mut self, literal: &str) -> Value { // Ensure return type is Value
-        let address = self.data_segment.len();
+    fn calculate_padding(current_len: usize, alignment: usize) -> usize {
+        if alignment == 0 { return 0; } // Avoid division by zero
+        let remainder = current_len % alignment;
+        if remainder == 0 { 0 } else { alignment - remainder }
+    }
+
+    /// Adds a string literal to the data segment.
+    /// Returns the starting BYTE OFFSET of the literal within the data segment.
+    /// Adds padding AFTER the null terminator to ensure subsequent data (like globals)
+    /// can be word-aligned if needed.
+    #[inline]
+    fn add_string_literal(&mut self, literal: &str) -> Value {
+        // Starting byte offset of this string (relative to data_segment start)
+        // This will now start at initial_padding_size (e.g., 4) for the first string.
+        let start_address = self.data_segment.len();
+
         self.data_segment.extend_from_slice(literal.as_bytes());
         self.data_segment.push(0); // Null-terminate
-        if address > i32::MAX as usize {
-            // Consider using u64 for addresses if needed, but C4 likely assumes 32-bit
+
+        // Add padding *after* the string to align the *next* item to a word boundary.
+        let current_len = self.data_segment.len();
+        // Use VALUE_SIZE_BYTES for alignment
+        let padding = Self::calculate_padding(current_len, VALUE_SIZE_BYTES);
+        self.data_segment.extend(std::iter::repeat(0).take(padding));
+
+        if start_address > i32::MAX as usize {
             panic!("Data segment address exceeds i32::MAX!");
         }
-        address as Value
+        start_address as Value // Return the starting byte offset (which is now >= initial_padding_size)
     }
+
+
 
     // Patching for jumps
     #[inline] fn reserve_jump_operand(&mut self, jump_instruction: Instruction) -> usize {
@@ -352,79 +395,144 @@ impl<'a> Parser<'a> {
     }
 
 
-    /// Parses one global declaration (variable, enum definition, or function).
-    fn parse_global_declaration(&mut self, is_function_hint: bool) -> ParseResult<()> {
-        let base_type: DataType;
-        let _start_line = self.current_pos().0; // Approx line - FIX: Mark unused
+// --- Update Global Variable Allocation ---
+fn parse_global_declaration(&mut self, is_function_hint: bool) -> ParseResult<()> {
+    let base_type: DataType;
+    // Store start info in case of error reporting, mark unused for now
+    let _start_info = self.current_token_info.clone();
 
-        // --- Parse Base Type or Enum ---
-        if self.peek_token()? == Some(&Token::Enum) {
-            self.parse_enum_declaration()?;
-            // Enum declaration doesn't declare a variable/function directly after
-            return Ok(()); // Handled inside parse_enum_declaration
-        } else if self.peek_token()? == Some(&Token::Int) {
-            self.next_token()?; base_type = DataType::Int;
-        } else if self.peek_token()? == Some(&Token::Char) {
-            self.next_token()?; base_type = DataType::Char;
-        } else if self.peek_token()? == Some(&Token::Void) {
-            self.next_token()?; base_type = DataType::Void;
-        } else {
-             let token_info = self.next_token()?;
-             return Err(ParseError::UnexpectedToken { expected: "type (int, char, void, enum)".into(), found: token_info.token, line: token_info.line, column: token_info.column });
-        }
+    // --- Parse Base Type or Enum ---
+    // Check for 'enum' first
+    if self.peek_token()? == Some(&Token::Enum) {
+         // It's an enum definition like `enum { ... };` or `enum Name { ... };`
+         // This handles the entire enum definition and semicolon if present.
+         self.parse_enum_declaration()?;
+         // After parsing the enum, the line is consumed. No further parsing needed here.
+         return Ok(());
+    } else if self.peek_token()? == Some(&Token::Int) {
+         self.next_token()?; // Consume 'int'
+         base_type = DataType::Int;
+    } else if self.peek_token()? == Some(&Token::Char) {
+         self.next_token()?; // Consume 'char'
+         base_type = DataType::Char;
+    } else if self.peek_token()? == Some(&Token::Void) {
+         self.next_token()?; // Consume 'void'
+         base_type = DataType::Void;
+    } else {
+         // Invalid start for a global declaration
+         let token_info = self.next_token()?; // Consume the unexpected token for error reporting
+         return Err(ParseError::UnexpectedToken {
+             expected: "global declaration (type or enum)".into(),
+             found: token_info.token,
+             line: token_info.line,
+             column: token_info.column
+         });
+    }
 
-        // --- Parse potential variable/function list ---
-        loop {
-            let current_type = self.parse_pointers(base_type.clone())?;
-            let (name, name_info) = self.expect_identifier("variable or function name")?;
+    // --- Parse potential variable/function list (e.g., int a, *b, func();) ---
+    loop {
+        // Parse potential '*' pointers after the base type
+        let current_type = self.parse_pointers(base_type.clone())?;
 
-            // --- Check if Function or Variable ---
-             if self.peek_token()? == Some(&Token::LParen) {
-                 if !is_function_hint && self.symbol_table.get_current_scope() != 0 {
-                     // Warn or error if we expected a variable based on hint but found '('
-                     // For now, proceed assuming it's a function
-                 }
-                 if base_type == DataType::Void && current_type == DataType::Void {
-                     // Allow void main(), void func(), etc.
-                 } else if current_type == DataType::Void {
-                     return Err(ParseError::Other(format!("Function '{}' cannot return void pointer at {}:{}", name, name_info.line, name_info.column)));
-                 }
-                 self.parse_function_definition(name, name_info, current_type)?;
-                 // Function definition ends the declaration line
-                 return Ok(()); // Expect ; or { handled inside parse_function_definition
-             } else {
-                  if is_function_hint {
-                     // Warn or error if we expected a function based on hint
-                     // For now, proceed assuming it's a variable
-                 }
-                 if current_type == DataType::Void {
-                     return Err(ParseError::Other(format!("Cannot declare variable '{}' of type void at {}:{}", name, name_info.line, name_info.column)));
-                 }
-                 // Global Variable Declaration
-                 let _sym = self.symbol_table.add(name.clone(), Token::Ident(name.clone()), SymbolClass::Glo, current_type.clone(), self.data_segment.len() as i64)
-                    .map_err(|e| Parser::map_add_error(e, &name, name_info.line, name_info.column))?; // Use static map_add_error
+        // Expect an identifier for the variable or function name
+        let (name, name_info) = self.expect_identifier("variable or function name")?;
 
-                 // Allocate space in data segment (simple: assume size of Value for int/ptr, byte for char)
-                 let size = current_type.size(); // Use size() method
-                 for _ in 0..size { self.data_segment.push(0); } // Initialize global to 0
-
-                 // Handle potential initializers if supported for globals (C4 doesn't really)
-                 if self.consume_optional(Token::Assign)? {
-                     // C4 doesn't support complex global initializers that require code execution.
-                     // Could potentially handle constant literals here.
-                     return Err(ParseError::Other(format!("Global initializers not supported at {}:{}", name_info.line, name_info.column)));
-                 }
+        // --- Check if Function or Variable based on lookahead ---
+         if self.peek_token()? == Some(&Token::LParen) {
+             // It looks like a function definition or declaration `type name (...)`
+             if !is_function_hint && self.symbol_table.get_current_scope() != 0 {
+                 // This condition seems unlikely here as parse_global_declaration
+                 // should only be called at scope 0. Included for robustness.
+                 eprintln!("Warning: Function definition like syntax found within non-global scope at {}:{}", name_info.line, name_info.column);
              }
 
-            // Check for end of declaration list (;) or another declaration (,)
-            if self.consume_optional(Token::Comma)? {
-                continue; // Parse next variable in the list
-            } else {
-                self.expect_token(Token::Semicolon, "';' or ',' after global declaration")?;
-                return Ok(()); // End of this global declaration line
-            }
-        } // End loop for vars on one line
-    }
+             // Check for disallowed function types (like void*) - adjust as needed for your C subset
+             if current_type == DataType::Void && !matches!(base_type, DataType::Void) {
+                 return Err(ParseError::Other(format!("Function '{}' cannot return void pointer at {}:{}", name, name_info.line, name_info.column)));
+             }
+
+             // It's a function definition (assuming declarations aren't separately handled)
+             // parse_function_definition handles adding to symbol table, parsing args/body
+             self.parse_function_definition(name, name_info, current_type)?;
+
+             // A function definition consumes the rest of the declaration line (params, body).
+             // We don't expect a comma or semicolon after the function body's '}'.
+             return Ok(()); // Exit parse_global_declaration successfully
+
+         } else {
+              // It looks like a variable declaration `type name [= init];` or `type name, ...;`
+              if is_function_hint {
+                 // If the earlier peek suggested a function, but we didn't find '(', maybe log a warning.
+                 eprintln!("Note: Expected function hint for '{}' but found variable syntax at {}:{}", name, name_info.line, name_info.column);
+             }
+
+             // Check for disallowed variable types (like void)
+             if current_type == DataType::Void {
+                 return Err(ParseError::Other(format!("Cannot declare variable '{}' of type void at {}:{}", name, name_info.line, name_info.column)));
+             }
+
+             // --- Global Variable Declaration Logic ---
+             // Calculate size and alignment needed for this variable.
+             let size_bytes = current_type.size() as usize;
+             let alignment = current_type.alignment();
+
+             // Calculate padding needed *before* this variable in the data segment
+             // based on the current length and the variable's alignment requirement.
+             let current_data_len = self.data_segment.len();
+             let padding = Self::calculate_padding(current_data_len, alignment);
+             self.data_segment.extend(std::iter::repeat(0).take(padding)); // Add padding bytes
+
+             // The starting byte offset is the length *after* adding padding.
+             // This offset is relative to the start of the `data_segment` Vec<u8>.
+             let start_byte_offset = self.data_segment.len();
+
+             // Check if the calculated offset exceeds the VM's address space (using i32::MAX)
+             if start_byte_offset > i32::MAX as usize {
+                 return Err(ParseError::Other(format!("Global variable '{}' offset exceeds address space at {}:{}", name, name_info.line, name_info.column)));
+             }
+
+             // Add the global variable symbol to the symbol table (scope 0).
+             // Store the calculated *relative byte offset* as its 'value'.
+             let _sym = self.symbol_table.add(
+                 name.clone(),
+                 Token::Ident(name.clone()), // Store the token if needed, or just name
+                 SymbolClass::Glo,          // It's a global variable
+                 current_type.clone(),      // Its data type
+                 start_byte_offset as i64   // Store its relative byte offset
+             ).map_err(|e| Parser::map_add_error(e, &name, name_info.line, name_info.column))?; // Map potential redeclaration error
+
+             // Reserve space for the variable itself in the data segment by adding zeros.
+             self.data_segment.extend(std::iter::repeat(0).take(size_bytes));
+             // --- End Global Variable Declaration Logic ---
+
+             // Handle potential initializers if supported for globals
+             // C4 doesn't support complex global initializers.
+             if self.consume_optional(Token::Assign)? {
+                 // If you were to support constant initializers:
+                 // 1. Parse the constant expression (e.g., number, char literal).
+                 // 2. Get the resulting constant value.
+                 // 3. Write the value directly into the `data_segment` at `start_byte_offset`.
+                 //    This requires careful handling of byte order and size.
+                 // For now, disallow initializers.
+                 return Err(ParseError::Other(format!("Global initializers are not supported at {}:{}", name_info.line, name_info.column)));
+             }
+         } // End of variable handling block
+
+        // After parsing one variable or function, check for ',' or ';'
+        if self.consume_optional(Token::Comma)? {
+            // Found a comma, continue the loop to parse the next variable in the list
+            // e.g., int a, b, c;
+            continue;
+        } else {
+            // Expect a semicolon to end the declaration list
+            // e.g., int a; or int a, b;
+            self.expect_token(Token::Semicolon, "';' or ',' after global declaration")?;
+            // Found the semicolon, this declaration line is finished.
+            return Ok(());
+        }
+    } // End loop for vars/funcs on one line (e.g. int a, b;)
+}
+
 
     /// Parses '*' pointers after a base type.
     fn parse_pointers(&mut self, mut base_type: DataType) -> ParseResult<DataType> {
@@ -459,6 +567,8 @@ impl<'a> Parser<'a> {
             if self.consume_optional(Token::Assign)? {
                  // Allow optional unary minus before number literal
                 let negative = self.consume_optional(Token::Sub)?;
+                // Use parse_expression here to handle potential negative constants?
+                // C4 likely only allows simple integer literals here.
                 let val_token = self.expect_token(Token::Number(0), "integer value for enum member")?; // Expect Num, value irrelevant here
                 if let Token::Number(mut num_val) = val_token.token {
                      if negative { num_val = -num_val; }
@@ -515,15 +625,20 @@ impl<'a> Parser<'a> {
                  let base_type = match self.peek_token()? {
                     Some(Token::Int) => { self.next_token()?; DataType::Int },
                     Some(Token::Char) => { self.next_token()?; DataType::Char },
-                    Some(Token::Void) => { self.next_token()?; DataType::Void }, // Allow void param? C doesn't really.
+                    Some(Token::Void) => {
+                         // Check if 'void' is the only param and no name follows
+                         self.next_token()?; // Consume void
+                         if self.peek_token()? == Some(&Token::RParen) && param_count == 0 {
+                              // This is `void func(void)` - valid, break loop
+                             break;
+                         } else {
+                             let (l, c) = self.current_pos();
+                              return Err(ParseError::Other(format!("'void' must be the only parameter and cannot have a name at {}:{}", l, c)));
+                         }
+                     },
                     _ => { let ti = self.next_token()?; return Err(ParseError::UnexpectedToken { expected:"parameter type".into(), found:ti.token, line:ti.line, column:ti.column }); }
                  };
                  let param_type = self.parse_pointers(base_type)?;
-                 // Check for void param - only allowed if it's the *only* param and name omitted?
-                 if param_type == DataType::Void && param_count > 0 {
-                     let (l,c) = self.current_pos();
-                     return Err(ParseError::Other(format!("'void' must be the only parameter at {}:{}", l, c)));
-                 }
 
                  let (param_name, param_name_info) = self.expect_identifier("parameter name")?;
 
@@ -583,15 +698,12 @@ impl<'a> Parser<'a> {
         }
 
         // Add implicit LEV if last instruction wasn't already LEV (from a return)
+        // Check the *actual last instruction*, not just the value (in case LEV takes an operand later?)
         let mut needs_lev = true;
         if let Some(&last_instr_val) = self.code.last() {
-            // Use the TryFrom defined in vm.rs (assuming it returns Result<_, VmError>)
-            if let Ok(instr) = Instruction::try_from(last_instr_val) {
-                if instr == Instruction::Lev {
-                    needs_lev = false;
-                }
+             if Instruction::try_from(last_instr_val).map_or(false, |instr| instr == Instruction::Lev) {
+                needs_lev = false;
             }
-            // If try_from fails, it wasn't LEV anyway.
         }
         if needs_lev {
             self.emit(Instruction::Lev);
@@ -619,8 +731,12 @@ impl<'a> Parser<'a> {
 
             // Calculate offset for this local variable
             // C4 allocates space based on type size, but uses word offsets for LEA.
-            // Let's stick to word offsets like C4 for simplicity.
+            // Stick to word offsets like C4 for simplicity.
             let size_in_words = var_type.size_in_words(); // Use size_in_words from symbol.rs
+            if size_in_words <= 0 {
+                // Avoid issues with void or zero-sized types if they somehow get here
+                 return Err(ParseError::Other(format!("Invalid size for local variable '{}' at {}:{}", name, name_info.line, name_info.column)));
+            }
             self.current_bp_offset -= size_in_words; // Decrement by size (e.g., -1 for int/ptr/char)
             let current_offset = self.current_bp_offset;
              // Update max size needed (absolute value of most negative offset -> count)
@@ -636,13 +752,16 @@ impl<'a> Parser<'a> {
                 self.emit_with_operand(Instruction::Lea, current_offset as Value); // Addr -> AX
                 self.emit(Instruction::Push); // Push address onto stack
                 // Parse initializer expression -> result in AX
-                let expr_info = self.parse_expression_with_level(PREC_ASSIGN)?;
+                let mut init_info = self.parse_expression_with_level(PREC_ASSIGN)?; // Changed var name
                 // Load value if initializer was LValue
-                let mut init_info = expr_info; // Rename to avoid confusion
                 if init_info.is_lvalue {
                     if let Some(load_instr) = init_info.lvalue_load_instr {
                         self.emit(load_instr);
                         init_info.is_lvalue = false;
+                        init_info.lvalue_load_instr = None; // Mark as loaded
+                    } else {
+                         // This shouldn't happen if is_lvalue is true for an initializer target
+                         return Err(ParseError::Other("Internal error: LValue initializer missing load instruction".into()));
                     }
                 }
                 // TODO: Type check initializer against var_type?
@@ -685,7 +804,12 @@ impl<'a> Parser<'a> {
     fn parse_if_statement(&mut self) -> ParseResult<()> {
         self.expect_token(Token::If, "if keyword")?;
         self.expect_token(Token::LParen, "'(' after if")?;
-        self.parse_expression_with_level(PREC_BOTTOM)?; // Condition -> AX
+        // Make sure expression result is loaded if it was an LValue
+        let mut cond_info = self.parse_expression_with_level(PREC_BOTTOM)?; // Condition -> AX
+        if cond_info.is_lvalue {
+             if let Some(load_instr) = cond_info.lvalue_load_instr { self.emit(load_instr); cond_info.is_lvalue = false; cond_info.lvalue_load_instr = None; }
+             else { return Err(ParseError::Other("Internal error: LValue condition missing load instruction".into())); }
+        }
         self.expect_token(Token::RParen, "')' after if condition")?;
 
         // Emit branch if zero (condition false)
@@ -723,7 +847,12 @@ impl<'a> Parser<'a> {
         let loop_start_addr = self.current_code_addr(); // Address before condition
 
         self.expect_token(Token::LParen, "'(' after while")?;
-        self.parse_expression_with_level(PREC_BOTTOM)?; // Condition -> AX
+        // Load condition if LValue
+        let mut cond_info = self.parse_expression_with_level(PREC_BOTTOM)?; // Condition -> AX
+         if cond_info.is_lvalue {
+             if let Some(load_instr) = cond_info.lvalue_load_instr { self.emit(load_instr); cond_info.is_lvalue = false; cond_info.lvalue_load_instr = None;}
+             else { return Err(ParseError::Other("Internal error: LValue condition missing load instruction".into())); }
+        }
         self.expect_token(Token::RParen, "')' after while condition")?;
 
         // Emit branch if zero (condition false) to exit loop
@@ -747,7 +876,12 @@ impl<'a> Parser<'a> {
         self.expect_token(Token::Return, "return keyword")?;
         if !self.consume_optional(Token::Semicolon)? {
             // Has return value
-            self.parse_expression_with_level(PREC_BOTTOM)?; // Result -> AX
+            let mut ret_info = self.parse_expression_with_level(PREC_BOTTOM)?; // Result -> AX
+            // Load value if LValue
+             if ret_info.is_lvalue {
+                if let Some(load_instr) = ret_info.lvalue_load_instr { self.emit(load_instr); ret_info.is_lvalue = false; ret_info.lvalue_load_instr = None;}
+                else { return Err(ParseError::Other("Internal error: LValue return value missing load instruction".into())); }
+             }
             // TODO: Check if expression type matches function return type
             self.expect_token(Token::Semicolon, "';' after return value")?;
         }
@@ -781,10 +915,29 @@ impl<'a> Parser<'a> {
 
      /// Parses expression;
     fn parse_expression_statement(&mut self) -> ParseResult<()> {
-        self.parse_expression_with_level(PREC_BOTTOM)?;
+        let mut expr_info = self.parse_expression_with_level(PREC_BOTTOM)?;
         // The result in AX is discarded for an expression statement.
-        // C4 VM might require explicit pop if expression leaves value on stack?
-        // Assume expression result is only in AX and doesn't need popping here.
+        // Ensure any final LValue is loaded before the semicolon, as its value might
+        // be needed if the expression has side effects that depend on the loaded value,
+        // even if the final value itself isn't used further. However, in C, usually
+        // side effects happen *before* the final value is determined.
+        // Let's stick to the pattern: load if LValue unless used by assignment etc.
+        // The final load *should* happen at the end of parse_expression_with_level.
+         if expr_info.is_lvalue {
+             if let Some(load_instr) = expr_info.lvalue_load_instr {
+                 // This suggests the load at the end of parse_expression_with_level might
+                 // not always occur if the expression ends with an LValue-producing op.
+                 // Let's add the load here for safety in statement context.
+                 self.emit(load_instr);
+                 expr_info.is_lvalue = false;
+                 expr_info.lvalue_load_instr = None;
+             } else {
+                 // This indicates an internal inconsistency.
+                 let (l, c) = self.current_pos();
+                 return Err(ParseError::Other(format!("Internal error: Unused LValue result missing load instruction near {}:{}", l, c)));
+             }
+             // eprintln!("Warning: LValue expression result potentially unused in expression statement near {}:{}", line, col);
+         }
         self.expect_token(Token::Semicolon, "';' after expression statement")?;
         Ok(())
     }
@@ -794,114 +947,140 @@ impl<'a> Parser<'a> {
     /// Parses an expression using operator precedence climbing.
     /// Entry point: parse_expression_with_level(PREC_ASSIGN) or PREC_BOTTOM
     fn parse_expression_with_level(&mut self, min_precedence: i32) -> ParseResult<ExprInfo> {
-        // Parse the left-hand side (primary or unary)
-        // Handle potential LValue loading deferral within parse_primary/postfix
-        let mut left_info = self.parse_primary()?;
+        // Parse the left-hand side (primary or unary, handled by parse_primary)
+        let mut left_info = self.parse_primary()?; // parse_primary calls parse_postfix_operations internally
 
-        loop {
-            let current_token = match self.peek_token()? {
-                Some(token) => token.clone(), // Clone token to check precedence
-                None => break, // End of input
-            };
+        loop { // Loop for binary operators
+            // 1. Peek *first* to check the precedence. Borrow ends after this call.
+            let maybe_precedence = self.peek_next_op_precedence(min_precedence)?;
 
-            // --- FIX: Corrected line ---
-            let precedence = self.get_operator_precedence(&current_token); // Pass reference to current_token
+            // 2. Decide whether to continue based on the peeked precedence
+            if let Some(precedence) = maybe_precedence {
+                // --- Precedence sufficient, now consume the operator ---
+                // 3. Consume the token. This is a *new* mutable borrow, safe now.
+                let op_token_info = self.next_token()?;
 
-            // Stop if operator precedence is lower than current minimum, or not an operator
-            if precedence < min_precedence || precedence == PREC_BOTTOM {
+                // --- Sanity check (optional but good) ---
+                // Use Parser::get_operator_precedence here too
+                let current_op_prec = Parser::get_operator_precedence(&op_token_info.token);
+                if current_op_prec != precedence {
+                     panic!(
+                         "Internal parser error: Precedence mismatch after peek. Expected {}, found {} for {:?}",
+                         precedence, current_op_prec, op_token_info.token
+                    );
+                }
+
+                // --- Load LHS LValue if needed (before push/ternary) ---
+                // Exception: Assignment operator *needs* the LValue address.
+                if left_info.is_lvalue && op_token_info.token != Token::Assign {
+                    if let Some(load_instr) = left_info.lvalue_load_instr {
+                        self.emit(load_instr);
+                        left_info.is_lvalue = false; // It's now loaded (an RValue in AX)
+                        left_info.lvalue_load_instr = None;
+                    } else {
+                        let (l, c) = (op_token_info.line, op_token_info.column);
+                        return Err(ParseError::Other(format!("Internal error: LValue missing load instruction before binary op {:?} at {}:{}", op_token_info.token, l, c)));
+                    }
+                }
+
+                // --- Handle Ternary ---
+                if op_token_info.token == Token::Cond { // '?'
+                    // AX has condition result (already loaded if it was LValue)
+                    let else_patch_loc = self.reserve_jump_operand(Instruction::Jz);
+                    // Parse the 'true' expression. Result -> AX
+                    let mut true_expr_info = self.parse_expression_with_level(PREC_COND)?;
+                    // Load result if LValue
+                    if true_expr_info.is_lvalue {
+                         if let Some(load_instr) = true_expr_info.lvalue_load_instr {
+                             self.emit(load_instr);
+                             true_expr_info.is_lvalue = false; // Ensure state is updated
+                             true_expr_info.lvalue_load_instr = None;
+                         } else { return Err(ParseError::Other("Internal error: LValue true-expr missing load instruction".into())); }
+                    }
+                    // Jump over 'false' expression if condition was true
+                    let end_patch_loc = self.reserve_jump_operand(Instruction::Jmp);
+                    // Patch Jz to land here (start of 'false' expression)
+                    self.patch_jump_target(else_patch_loc, self.current_code_addr());
+                    // Parse the ':'
+                    self.expect_token(Token::Colon, "':' for conditional operator")?;
+                    // Parse the 'false' expression. Result -> AX
+                    let mut false_expr_info = self.parse_expression_with_level(PREC_COND)?;
+                    // Load result if LValue
+                    if false_expr_info.is_lvalue {
+                         if let Some(load_instr) = false_expr_info.lvalue_load_instr {
+                            self.emit(load_instr);
+                            false_expr_info.is_lvalue = false; // Ensure state is updated
+                            false_expr_info.lvalue_load_instr = None;
+                         } else { return Err(ParseError::Other("Internal error: LValue false-expr missing load instruction".into())); }
+                    }
+                    // Patch Jmp to land here (end of conditional)
+                    self.patch_jump_target(end_patch_loc, self.current_code_addr());
+                    // Result type is usually Int or promotes; C4 is simple, assume Int. LValue is false.
+                    // TODO: Type check - types of true/false branches should be compatible.
+                    left_info = ExprInfo { data_type: DataType::Int, is_lvalue: false, lvalue_load_instr: None };
+                    continue; // Important: Continue the outer loop after handling ternary
+                 }
+
+                // --- Push LHS, Parse RHS (For non-ternary binary operators) ---
+                // LHS is in AX (either value, or address for '=')
+                self.emit(Instruction::Push); // Push LHS (value or address) onto stack
+                let next_min_precedence = if Self::is_right_associative(&op_token_info.token) {
+                     precedence
+                } else {
+                     precedence + 1
+                };
+                // Parse the RHS. Result -> AX
+                let mut right_info = self.parse_expression_with_level(next_min_precedence)?;
+
+                // --- Load RHS LValue ---
+                // The RHS of a binary operator is always needed as a value.
+                if right_info.is_lvalue {
+                    if let Some(load_instr) = right_info.lvalue_load_instr {
+                        self.emit(load_instr);
+                        right_info.is_lvalue = false; // Now loaded
+                        right_info.lvalue_load_instr = None;
+                    } else {
+                        let (l, c) = self.current_pos();
+                        return Err(ParseError::Other(format!("Internal error: LValue RHS missing load instruction near {}:{}", l, c)));
+                    }
+                 }
+
+                // --- Emit Binary Op Code ---
+                // emit_binary_op_code takes LHS info (mainly for '=' check and pointer type) and RHS info (type)
+                // Stack: [LHS (val or addr)], AX: RHS value
+                // Result will be placed in AX. left_info updated with result type/lvalue status.
+                left_info = self.emit_binary_op_code(&op_token_info.token, left_info, right_info)?;
+                // Loop continues to check next operator precedence
+
+            } else {
+                // 4. Peeked operator precedence was too low, or no operator -> break loop
                 break;
             }
+        } // End binary operator loop
 
-            // --- Handle Binary Operator ---
-            let op_token_info = self.next_token()?; // Consume the operator
-
-            // If LHS was an LValue (address in AX), load its value now before PUSH,
-            // unless the operator is assignment (=) or array index ([]).
-            if left_info.is_lvalue && op_token_info.token != Token::Assign && op_token_info.token != Token::LBracket {
-                 if let Some(load_instr) = left_info.lvalue_load_instr {
-                    self.emit(load_instr); // LI / LC
-                    left_info.is_lvalue = false; // Now it's the value (RValue)
-                 } else {
-                    // This shouldn't happen if is_lvalue is true
-                    return Err(ParseError::Other("Internal error: LValue missing load instruction".into()));
-                 }
-            }
-
-
-            // Special handling for ternary/conditional operator ?:
-            if op_token_info.token == Token::Cond { // '?'
-                 // Condition result is already in AX from left_info
-                 let else_patch_loc = self.reserve_jump_operand(Instruction::Jz); // Branch if Zero
-
-                // Parse the 'true' expression (result goes to AX)
-                let _true_expr_info = self.parse_expression_with_level(PREC_COND)?;
-
-                // Jump over the 'false' expression
-                let end_patch_loc = self.reserve_jump_operand(Instruction::Jmp);
-
-                // Patch Jz to jump here (start of 'false' expression)
-                self.patch_jump_target(else_patch_loc, self.current_code_addr());
-
-                self.expect_token(Token::Colon, "':' for conditional operator")?;
-
-                 // Parse the 'false' expression (result goes to AX)
-                let _false_expr_info = self.parse_expression_with_level(PREC_COND)?;
-
-                // Patch JMP to jump here (after 'false' expression)
-                self.patch_jump_target(end_patch_loc, self.current_code_addr());
-
-                 // Type of conditional expr? Could be complex. Assume INT for simplicity like C4.
-                 // Result is RValue.
-                left_info = ExprInfo { data_type: DataType::Int, is_lvalue: false, lvalue_load_instr: None };
-                continue; // Continue parsing loop, result is in AX
-            }
-
-            // Push LHS result/address before parsing RHS
-            // If it was an LValue address for assignment, AX holds address.
-            // If it was an RValue, AX holds value.
-            self.emit(Instruction::Push);
-
-            // Recursively parse the right-hand side with precedence + 1 (for left-associativity)
-            // or precedence (for right-associativity like assignment)
-            let next_min_precedence = if Self::is_right_associative(&op_token_info.token) {
-                precedence
-            } else {
-                precedence + 1
-            };
-            let mut right_info = self.parse_expression_with_level(next_min_precedence)?;
-
-            // If RHS was an LValue (address in AX), load its value now.
-            if right_info.is_lvalue {
-                 if let Some(load_instr) = right_info.lvalue_load_instr {
-                    self.emit(load_instr); // LI / LC
-                    right_info.is_lvalue = false; // Now it's the value (RValue)
-                 } else {
-                    return Err(ParseError::Other("Internal error: LValue missing load instruction".into()));
-                 }
-            }
-
-            // --- Emit code for the binary operator ---
-            // Stack has LHS (addr or value), AX has RHS value
-            left_info = self.emit_binary_op_code(&op_token_info.token, left_info, right_info)?;
-
-        } // End loop
-
-        // Final check: If the overall expression result was an LValue address
-        // (e.g., just a variable name `x;`) and it wasn't used by an operator
-        // that consumes the address (like assignment), load the value now.
+        // --- FINAL LVALUE LOAD ---
+        // After all operators are processed, if the final result (left_info)
+        // is still an LValue (address in AX), load the actual value into AX.
+        // This is necessary for using the expression's value (e.g., in `if (x)`, `return y`, `a = b`).
+        // The only time we *don't* want to load is if this expression is the direct LHS of an assignment,
+        // which is handled by the check `op_token_info.token != Token::Assign` inside the loop.
+        // If the loop doesn't run (e.g., expression is just `x`), or finishes, this load is needed.
         if left_info.is_lvalue {
-            if let Some(load_instr) = left_info.lvalue_load_instr {
-                self.emit(load_instr); // LI / LC
-                left_info.is_lvalue = false; // Now it's the value (RValue)
-            }
-         }
+             if let Some(load_instr) = left_info.lvalue_load_instr {
+                 self.emit(load_instr);
+                 left_info.is_lvalue = false;
+                 left_info.lvalue_load_instr = None;
+             } else {
+                 let (l, c) = self.current_pos(); // Use position after last token
+                 return Err(ParseError::Other(format!("Internal error: Final LValue result missing load instruction near {}:{}", l, c)));
+             }
+        }
 
-
-        Ok(left_info)
+        Ok(left_info) // Return the final expression info (RValue in AX)
     }
 
      /// Gets the precedence level of a binary operator token.
-    fn get_operator_precedence(&self, token: &Token) -> i32 {
+     fn get_operator_precedence(token: &Token) -> i32 {
         match token {
             Token::Assign => PREC_ASSIGN,
             Token::Cond => PREC_COND, // ?
@@ -915,11 +1094,7 @@ impl<'a> Parser<'a> {
             Token::Shl | Token::Shr => PREC_SHIFT,
             Token::Add | Token::Sub => PREC_ADD, // Binary + -
             Token::Mul | Token::Div | Token::Mod => PREC_MUL, // Binary * / %
-            // Postfix ops handled separately, but precedence needed for climbing
-            Token::LBracket => PREC_POSTFIX, // Array subscript []
-            Token::LParen => PREC_POSTFIX,   // Function call ()
-            Token::Inc | Token::Dec => PREC_POSTFIX, // Postfix ++/-- (handled in parse_primary)
-            // Add other binary operators here
+            // Postfix ops handled separately by parse_postfix_operations
             _ => PREC_BOTTOM, // Not a binary operator we handle here
         }
     }
@@ -931,10 +1106,11 @@ impl<'a> Parser<'a> {
      /// Emits VM code for a binary operator.
      /// Assumes LHS (value or address) is on stack, RHS value is in AX.
      /// Result ends up in AX.
+     /// Updates and returns the ExprInfo reflecting the result.
      fn emit_binary_op_code(&mut self, op: &Token, left: ExprInfo, right: ExprInfo) -> ParseResult<ExprInfo> {
         // Default result type is Int, LValue is false unless it's assignment
-        let result_type; // Assign within each match arm - FIX: Remove mut
-        let result_lvalue = false; // Binary ops usually produce RValues
+        let result_type;
+        let result_lvalue = false; // Only true if the op *results* in an LValue (uncommon for binary)
 
         match op {
             // Assignment (=)
@@ -942,13 +1118,14 @@ impl<'a> Parser<'a> {
                  // Stack: [lhs_addr], AX: rhs_value
                  if !left.is_lvalue {
                      let (l, c) = self.current_pos(); // Position of the assignment op
-                     return Err(ParseError::NotAssignable("expression".into(), l, c));
+                     return Err(ParseError::NotAssignable("left side of assignment".into(), l, c));
                  }
                  // Type of assignment is type of LHS
                 result_type = left.data_type.clone();
                 // Emit store (pops address, stores AX)
                 self.emit_store(&result_type)?;
                  // Result of assignment in C is the assigned value (RValue), which is already in AX.
+                 // No need to update result_lvalue, it stays false.
             }
 
             // Arithmetic (+, -, *, /, %)
@@ -960,13 +1137,24 @@ impl<'a> Parser<'a> {
                       return Err(ParseError::TypeMismatch("Cannot add two pointers".into(), l, c));
                  } else if left.data_type.is_pointer() && right.data_type.is_int_or_char() {
                      // ptr + int: Scale int (in AX)
-                     self.emit_pointer_scaling(left.data_type.deref().unwrap_or(DataType::Char)); // Scale int in AX
+                     // Stack: [ptr_val], AX: int_val
+                     self.emit_pointer_scaling(left.data_type.deref().unwrap_or(DataType::Char)); // Scale int in AX by size of pointed-to type
                      self.emit(Instruction::Add); // Add ptr (from stack) + scaled_int (AX) -> AX
                      result_type = left.data_type; // Result is pointer
                  } else if left.data_type.is_int_or_char() && right.data_type.is_pointer() {
-                     // int + ptr: Swap required conceptually. VM might handle, or need PSH/POP
-                     // Simple VM: Just add. Assume ptr + int order doesn't matter for VM ADD.
-                     self.emit(Instruction::Add); // Add int (from stack) + ptr (AX) -> AX
+                     // int + ptr: Need to scale the int (on stack) before adding.
+                     // Stack: [int_val], AX: ptr_val
+                     // Use PUSH/IMM 0/ADD sequence twice to swap AX and stack top without Swap/PopAx
+                     self.emit(Instruction::Push); // Push ptr_val. Stack: [int_val, ptr_val]
+                     self.emit_with_operand(Instruction::Imm, 0); // AX = 0
+                     self.emit(Instruction::Add); // AX = ptr_val + 0 = ptr_val. Stack: [int_val] (Pops ptr_val)
+                     self.emit(Instruction::Push); // Push ptr_val. Stack: [int_val, ptr_val] (Put it back)
+                     self.emit_with_operand(Instruction::Imm, 0); // AX = 0
+                     self.emit(Instruction::Add); // AX = int_val + 0 = int_val. Stack: [ptr_val] (Pops int_val)
+                     // Now AX has int_val, Stack has ptr_val
+
+                     self.emit_pointer_scaling(right.data_type.deref().unwrap_or(DataType::Char)); // Scale int in AX by element size
+                     self.emit(Instruction::Add); // Add ptr (from stack) + scaled_int (AX) -> AX
                      result_type = right.data_type; // Result is pointer
                  } else { // Both INT/CHAR
                      self.emit(Instruction::Add);
@@ -979,10 +1167,11 @@ impl<'a> Parser<'a> {
                  if left.data_type.is_pointer() && right.data_type.is_pointer() {
                      // ptr - ptr = int (difference scaled down)
                      self.emit(Instruction::Sub); // AX = ptr(stack) - ptr(AX)
-                     self.emit_pointer_scaling_division(left.data_type.deref().unwrap_or(DataType::Char)); // Scale AX
+                     self.emit_pointer_scaling_division(left.data_type.deref().unwrap_or(DataType::Char)); // Scale AX (result) down
                      result_type = DataType::Int;
                  } else if left.data_type.is_pointer() && right.data_type.is_int_or_char() {
                      // ptr - int = ptr
+                     // Stack: [ptr_val], AX: int_val
                      self.emit_pointer_scaling(left.data_type.deref().unwrap_or(DataType::Char)); // Scale int in AX
                      self.emit(Instruction::Sub); // AX = ptr(stack) - scaled_int(AX)
                      result_type = left.data_type;
@@ -998,7 +1187,7 @@ impl<'a> Parser<'a> {
             Token::Div => { self.emit(Instruction::Div); result_type = DataType::Int; }
             Token::Mod => { self.emit(Instruction::Mod); result_type = DataType::Int; }
 
-             // Relational (==, !=, <, >, <=, >=) -> Result is always Int (0 or 1)
+            // Relational (==, !=, <, >, <=, >=) -> Result is always Int (0 or 1)
             Token::Eq => { self.emit(Instruction::Eq); result_type = DataType::Int; }
             Token::Ne => { self.emit(Instruction::Ne); result_type = DataType::Int; }
             Token::Lt => { self.emit(Instruction::Lt); result_type = DataType::Int; }
@@ -1006,483 +1195,430 @@ impl<'a> Parser<'a> {
             Token::Le => { self.emit(Instruction::Le); result_type = DataType::Int; }
             Token::Ge => { self.emit(Instruction::Ge); result_type = DataType::Int; }
 
-             // Bitwise (|, ^, &)
+            // Bitwise (|, ^, &)
             Token::BitOr => { self.emit(Instruction::Or); result_type = DataType::Int; }
             Token::BitXor => { self.emit(Instruction::Xor); result_type = DataType::Int; }
             Token::BitAnd => { self.emit(Instruction::And); result_type = DataType::Int; }
 
-             // Shift (<<, >>)
+            // Shift (<<, >>)
             Token::Shl => { self.emit(Instruction::Shl); result_type = DataType::Int; }
             Token::Shr => { self.emit(Instruction::Shr); result_type = DataType::Int; }
 
-            // Logical (||, &&) - C4 uses short-circuiting via jumps.
-            // This simple implementation is NOT short-circuiting.
-            // TODO: Implement proper short-circuiting for || and && using Jz/Jnz/Jmp
+            // Logical (||, &&) - Non-short-circuiting for now
             Token::Lor => {
-                 // Simple (non-short-circuit): Convert both operands to 0/1 then OR?
-                 // Or just OR bits and check if result is non-zero.
-                 self.emit(Instruction::Or); // Combine bits
+                 // Stack: [lhs_val], AX: rhs_val
+                 // C4 implements non-short-circuiting || as (lhs | rhs) != 0
+                 self.emit(Instruction::Or); // AX = lhs | rhs
                  self.emit(Instruction::Push); // Push result
                  self.emit_with_operand(Instruction::Imm, 0); // Load 0
                  self.emit(Instruction::Ne); // AX = (result != 0) ? 1 : 0
                  result_type = DataType::Int;
-             }
-             Token::Lan => {
-                 self.emit(Instruction::And); // Combine bits
-                 self.emit(Instruction::Push); // Push result
-                 self.emit_with_operand(Instruction::Imm, 0); // Load 0
-                 self.emit(Instruction::Ne); // AX = (result != 0) ? 1 : 0
+            }
+            Token::Lan => {
+                 // Stack: [lhs_val], AX: rhs_val
+                 // C4 implements non-short-circuiting && as (lhs & rhs) != 0 ???
+                 // More accurately, C bool logic is (lhs != 0) && (rhs != 0)
+                 // Simple (but maybe incorrect) C4 version: (lhs && rhs) != 0 equivalent?
+                 // Let's do (lhs != 0) + (rhs != 0) == 2 ? No, that's not right.
+                 // Let's try the bitwise `And` then check != 0, similar to `Or`
+                 // This isn't semantically correct C, but might match C4 target.
+                 // Correct C: Convert both to 0/1, then AND.
+                 // AX = rhs != 0 ? 1 : 0
+                 self.emit(Instruction::Push); // Push rhs
+                 self.emit_with_operand(Instruction::Imm, 0);
+                 self.emit(Instruction::Ne); // AX = rhs != 0 ? 1 : 0
+                 // Stack: [lhs_val, rhs_bool]
+                 // Swap using temp calculation
+                 self.emit(Instruction::Push); // [lhs_val, rhs_bool, rhs_bool_ax]
+                 self.emit_with_operand(Instruction::Imm, 0);
+                 self.emit(Instruction::Add); // AX = rhs_bool; Stack: [lhs_val, rhs_bool]
+                 self.emit(Instruction::Push); // [lhs_val, rhs_bool, rhs_bool_ax]
+                 self.emit_with_operand(Instruction::Imm, 0);
+                 self.emit(Instruction::Add); // AX = lhs_val; Stack: [rhs_bool]
+
+                 // Now AX = lhs_val
+                 self.emit(Instruction::Push); // Push lhs_val
+                 self.emit_with_operand(Instruction::Imm, 0);
+                 self.emit(Instruction::Ne); // AX = lhs != 0 ? 1 : 0
+                 // Stack: [rhs_bool]
+
+                 // Now AX = lhs_bool
+                 self.emit(Instruction::And); // AX = lhs_bool & rhs_bool
                  result_type = DataType::Int;
             }
 
-             // Array Indexing ([) - Handled as a postfix operator in parse_primary. Should not reach here.
-            Token::LBracket => {
-                 return Err(ParseError::Other("Internal error: Array index operator reached binary handler".into()));
-            }
 
             _ => return Err(ParseError::Other(format!("Unsupported binary operator: {:?}", op))),
         }
 
-        Ok(ExprInfo { data_type: result_type, is_lvalue: result_lvalue, lvalue_load_instr: None }) // Result is RValue
+        // Result is always RValue except for ops that might specifically return LValues (none here)
+        Ok(ExprInfo { data_type: result_type, is_lvalue: result_lvalue, lvalue_load_instr: None })
      }
 
      /// Emits code to multiply value in AX by sizeof type, for pointer scaling.
      fn emit_pointer_scaling(&mut self, target_type: DataType) {
-         let size = target_type.size();
+         let size = target_type.size(); // Size in bytes
          if size > 1 {
              self.emit(Instruction::Push); // Push index/offset (in AX)
-             self.emit_with_operand(Instruction::Imm, size as Value); // Load size
+             self.emit_with_operand(Instruction::Imm, size as Value); // Load size in bytes
              self.emit(Instruction::Mul); // AX = index * size
          }
-         // If size is 1, no scaling needed
+         // If size is 1 (char), no scaling needed
      }
       /// Emits code to divide value in AX by sizeof type, for pointer difference scaling.
      fn emit_pointer_scaling_division(&mut self, target_type: DataType) {
-          let size = target_type.size();
+          let size = target_type.size(); // Size in bytes
           if size > 1 {
              self.emit(Instruction::Push); // Push difference (in AX)
-             self.emit_with_operand(Instruction::Imm, size as Value); // Load size
+             self.emit_with_operand(Instruction::Imm, size as Value); // Load size in bytes
              self.emit(Instruction::Div); // AX = difference / size
          }
+         // If size is 1 (char), no division needed
      }
 
 
-    /// Parses primary expressions: literals, identifiers (vars/calls), parentheses, unary ops, postfix ops.
-    /// Handles deferred loading of LValues.
-    fn parse_primary(&mut self) -> ParseResult<ExprInfo> {
-        let token_info = self.next_token()?;
-        let mut expr_info: ExprInfo;
+     #[allow(dead_code)] // Keep this potentially unused helper for now
+     fn peek_is_postfix_operator(&mut self) -> ParseResult<bool> {
+        let result = matches!(
+            self.peek_token()?, // Borrow contained here
+            Some(Token::LBracket | Token::LParen | Token::Inc | Token::Dec)
+        );
+        Ok(result)
+    }
 
-        match token_info.token {
+     /// Peeks at the next token and returns its precedence if it's a binary operator
+     /// with precedence >= min_precedence. Otherwise returns None.
+     /// Takes &mut self because peek_token takes &mut self.
+/// Peeks at the next token and returns its precedence if it's a binary operator
+     /// with precedence >= min_precedence. Otherwise returns None.
+     /// Takes &mut self because peek_token takes &mut self.
+     fn peek_next_op_precedence(&mut self, min_precedence: i32) -> ParseResult<Option<i32>> {
+        match self.tokens.peek() { // Mutable borrow on self.tokens starts here
+            Some(Ok(token_info)) => {
+                // Call the associated function (no `self` borrow needed)
+                let precedence = Parser::get_operator_precedence(&token_info.token);
+                if precedence >= min_precedence && precedence != PREC_BOTTOM {
+                    Ok(Some(precedence)) // Return precedence if valid operator
+                } else {
+                    Ok(None) // Precedence too low or not an operator
+                }
+            }
+            Some(Err(lex_err)) => Err(ParseError::LexerError(lex_err.clone())), // Handle lexer error
+            None => Ok(None), // End of input
+        }
+        // Borrow from peek() ends here
+    }
+
+
+    /// Parses primary expressions: literals, identifiers (vars/calls), parentheses, unary ops.
+    /// Handles subsequent postfix ops using an `if let` loop structure.
+    fn parse_primary(&mut self) -> ParseResult<ExprInfo> {
+        // --- Store token info before consuming (needed for function call Sys check) ---
+        let primary_token_info = match self.tokens.peek() {
+             Some(Ok(info)) => info.clone(),
+             Some(Err(e)) => return Err(ParseError::LexerError(e.clone())),
+             None => return Err(ParseError::EndOfInput),
+        };
+        let token_info = self.next_token()?; // Consume the token
+
+        let mut expr_info: ExprInfo; // This will be updated by postfix ops
+
+        match token_info.token { // Use the *consumed* token_info here
+            // --- Cases for Number, StringLiteral, CharLiteral, Ident, LParen (Cast/Group), Unary Ops ---
+            // (Keep the existing logic for all these primary/unary cases exactly as before)
             Token::Number(val) => {
-                 if val < i32::MIN as i64 || val > i32::MAX as i64 { /* Range check? */ }
                  self.emit_with_operand(Instruction::Imm, val as Value);
                  expr_info = ExprInfo { data_type: DataType::Int, is_lvalue: false, lvalue_load_instr: None };
             }
             Token::StringLiteral(s) => {
                  let addr = self.add_string_literal(&s);
                  self.emit_with_operand(Instruction::Imm, addr);
-                 // String literals decay to char*
                  expr_info = ExprInfo { data_type: DataType::Ptr(Box::new(DataType::Char)), is_lvalue: false, lvalue_load_instr: None };
             }
-             Token::CharLiteral(c) => {
+            Token::CharLiteral(c) => {
                 self.emit_with_operand(Instruction::Imm, c as Value);
                 expr_info = ExprInfo { data_type: DataType::Char, is_lvalue: false, lvalue_load_instr: None };
             }
-            Token::Ident(name) => {
-                let sym = self.symbol_table.find(&name)
+            Token::Ident(ref name) => {
+                let sym = self.symbol_table.find(name)
                     .ok_or_else(|| ParseError::UndefinedSymbol(name.clone(), token_info.line, token_info.column))?
-                    .clone(); // Clone symbol data
-
+                    .clone();
                 match sym.class {
-                    SymbolClass::Num => { // Enum member
-                        self.emit_with_operand(Instruction::Imm, sym.value as Value);
-                        expr_info = ExprInfo { data_type: DataType::Int, is_lvalue: false, lvalue_load_instr: None };
-                    }
-                    SymbolClass::Loc | SymbolClass::Glo => {
-                        // Emit address calculation -> AX
-                        if sym.class == SymbolClass::Loc {
-                            self.emit_with_operand(Instruction::Lea, sym.value as Value); // LEA bp+offset -> AX
-                        } else { // Glo
-                            self.emit_with_operand(Instruction::Imm, sym.value as Value); // IMM data_addr -> AX
-                        }
-                        // Now AX contains the address (LValue). Store the appropriate load instruction.
-                         let load_instr = Some(if sym.data_type == DataType::Char { Instruction::Lc } else { Instruction::Li });
-                         expr_info = ExprInfo { data_type: sym.data_type.clone(), is_lvalue: true, lvalue_load_instr: load_instr };
-                        // **Defer the LI/LC**: Load only when used as RValue (handled by callers or end of parse_primary)
-                    }
-                    SymbolClass::Fun | SymbolClass::Sys => {
-                        // Function name used directly yields address/ID.
-                        if sym.value < i32::MIN as i64 || sym.value > i32::MAX as i64 { /* Range check */ }
-                        self.emit_with_operand(Instruction::Imm, sym.value as Value);
-                         // Represent function type? C4 doesn't have strong func types. Use Ptr(ReturnType).
-                        expr_info = ExprInfo { data_type: DataType::Ptr(Box::new(sym.data_type)), is_lvalue: false, lvalue_load_instr: None };
-                    }
-                     SymbolClass::Enum => {
-                        // Enum tag name used directly? Invalid in C4 expressions.
-                         return Err(ParseError::Other(format!("Cannot use enum tag '{}' directly in expression at {}:{}", name, token_info.line, token_info.column)));
-                    }
-                    SymbolClass::Key => { // Should not happen if lexer is correct
-                        return Err(ParseError::Other(format!("Unexpected keyword '{}' in expression at {}:{}", name, token_info.line, token_info.column)));
-                    }
+                    SymbolClass::Num => { self.emit_with_operand(Instruction::Imm, sym.value as Value); expr_info = ExprInfo { data_type: DataType::Int, is_lvalue: false, lvalue_load_instr: None }; }
+                    SymbolClass::Loc => { self.emit_with_operand(Instruction::Lea, sym.value as Value); let load_instr = Some(if sym.data_type == DataType::Char { Instruction::Lc } else { Instruction::Li }); expr_info = ExprInfo { data_type: sym.data_type.clone(), is_lvalue: true, lvalue_load_instr: load_instr }; }
+                    SymbolClass::Glo => { self.emit_with_operand(Instruction::Imm, sym.value as Value); let load_instr = Some(if sym.data_type == DataType::Char { Instruction::Lc } else { Instruction::Li }); expr_info = ExprInfo { data_type: sym.data_type.clone(), is_lvalue: true, lvalue_load_instr: load_instr }; }
+                    SymbolClass::Fun | SymbolClass::Sys => { self.emit_with_operand(Instruction::Imm, sym.value as Value); let fn_ptr_type = if sym.class == SymbolClass::Fun { DataType::Ptr(Box::new(sym.data_type)) } else { sym.data_type }; expr_info = ExprInfo { data_type: fn_ptr_type, is_lvalue: false, lvalue_load_instr: None }; }
+                    SymbolClass::Enum => { return Err(ParseError::Other(format!("Cannot use enum tag '{}' directly in expression at {}:{}", name, token_info.line, token_info.column))); }
+                    SymbolClass::Key => { return Err(ParseError::Other(format!("Unexpected keyword '{}' in expression at {}:{}", name, token_info.line, token_info.column))); }
                 }
             }
             Token::LParen => { // Parentheses or Cast
-                // Peek to distinguish (type) from (expr)
                 if matches!(self.peek_token()?, Some(Token::Int | Token::Char | Token::Void)) {
-                    // Check if it's followed by '*' or ')' to confirm type cast intent
-                    // Simple check: if it's a type keyword, assume cast for now.
-                    expr_info = self.parse_cast_expression()? // Returns ExprInfo
-                } else { // Grouping parentheses
-                    expr_info = self.parse_expression_with_level(PREC_BOTTOM)?;
-                    self.expect_token(Token::RParen, "')' to close parenthesis")?;
-                    // Result type/lvalue status comes from inner expression
-                    // Load if inner result was LValue and wasn't consumed
-                     if expr_info.is_lvalue {
-                         if let Some(load_instr) = expr_info.lvalue_load_instr {
-                             self.emit(load_instr);
-                             expr_info.is_lvalue = false;
-                         }
-                     }
-                }
+                    let is_cast = { /* Existing lookahead logic for cast */
+                        let mut temp_lexer = self.tokens.clone(); let mut lookahead_count = 0; let max_lookahead = 4; let mut is_likely_cast = false;
+                         if matches!(temp_lexer.next(), Some(Ok(TokenInfo{token: Token::Int | Token::Char | Token::Void, ..}))) {
+                             lookahead_count += 1; while let Some(Ok(TokenInfo{token: Token::Asterisk, ..})) = temp_lexer.peek() { if lookahead_count >= max_lookahead { break; } temp_lexer.next(); lookahead_count += 1; }
+                             if let Some(Ok(TokenInfo{token: Token::RParen, ..})) = temp_lexer.peek() { is_likely_cast = true; }
+                         } is_likely_cast };
+                    if is_cast { expr_info = self.parse_cast_expression()?; }
+                    else { expr_info = self.parse_expression_with_level(PREC_BOTTOM)?; self.expect_token(Token::RParen, "')' to close parenthesis")?; }
+                } else { expr_info = self.parse_expression_with_level(PREC_BOTTOM)?; self.expect_token(Token::RParen, "')' to close parenthesis")?; }
             }
-
-            // --- Unary Operators ---
-             Token::Sizeof => {
-                self.expect_token(Token::LParen, "'(' after sizeof")?;
-                 // Sizeof can take a type or an expression
-                 // Peek to see if it's a type name
+            Token::Sizeof => { /* Existing Sizeof logic */
+                 self.expect_token(Token::LParen, "'(' after sizeof")?;
                  let size = if matches!(self.peek_token()?, Some(Token::Int | Token::Char | Token::Void)) {
-                     // Assume sizeof(type)
-                     let target_type = self.parse_type()?;
-                     target_type.size()
-                 } else {
-                     // Assume sizeof(expression)
-                     let expr_value_info = self.parse_expression_with_level(PREC_BOTTOM)?;
-                     // We only need the type's size, the expression code is discarded
-                     // C standard: sizeof(expr) doesn't evaluate expr.
-                     expr_value_info.data_type.size()
-                 };
-                self.expect_token(Token::RParen, "')' after sizeof argument")?;
+                     let is_type = { /* Existing lookahead logic for sizeof(type) */
+                        let mut temp_lexer = self.tokens.clone(); let mut lookahead_count = 0; let max_lookahead = 4; let mut is_likely_type = false;
+                         if matches!(temp_lexer.next(), Some(Ok(TokenInfo{token: Token::Int | Token::Char | Token::Void, ..}))) {
+                             lookahead_count += 1; while let Some(Ok(TokenInfo{token: Token::Asterisk, ..})) = temp_lexer.peek() { if lookahead_count >= max_lookahead { break; } temp_lexer.next(); lookahead_count += 1; }
+                              if let Some(Ok(TokenInfo{token: Token::RParen, ..})) = temp_lexer.peek() { is_likely_type = true; }
+                         } is_likely_type };
+                     if is_type { let target_type = self.parse_type()?; target_type.size() }
+                     else { return Err(ParseError::InvalidSizeofTarget(token_info.line, token_info.column)); }
+                 } else { return Err(ParseError::InvalidSizeofTarget(token_info.line, token_info.column)); };
+                 self.expect_token(Token::RParen, "')' after sizeof argument")?;
                  self.emit_with_operand(Instruction::Imm, size as Value);
-                 expr_info = ExprInfo { data_type: DataType::Int, is_lvalue: false, lvalue_load_instr: None };
-             }
-             Token::Asterisk => { // Dereference (*)
-                 // Parse operand first
+                 expr_info = ExprInfo { data_type: DataType::Int, is_lvalue: false, lvalue_load_instr: None }; }
+            Token::Asterisk => { /* Existing Dereference (*) logic */
+                let mut inner_info = self.parse_expression_with_level(PREC_UNARY)?;
+                 if inner_info.is_lvalue { if let Some(load_instr) = inner_info.lvalue_load_instr { self.emit(load_instr); inner_info.is_lvalue = false; inner_info.lvalue_load_instr = None; } else { return Err(ParseError::Other("Internal error: LValue operand for * missing load instruction".into())); } }
+                 if let DataType::Ptr(target_type) = inner_info.data_type { let target_load_instr = Some(if *target_type == DataType::Char { Instruction::Lc } else { Instruction::Li }); expr_info = ExprInfo { data_type: *target_type, is_lvalue: true, lvalue_load_instr: target_load_instr }; }
+                 else { return Err(ParseError::InvalidDereference(token_info.line, token_info.column)); } }
+            Token::Ampersand => { /* Existing Address-of (&) logic */
                 let inner_info = self.parse_expression_with_level(PREC_UNARY)?;
-                 // If operand was LValue address, load the value (which is the pointer)
-                 let mut current_info = inner_info;
-                 if current_info.is_lvalue {
-                    if let Some(load_instr) = current_info.lvalue_load_instr {
-                        self.emit(load_instr);
-                        current_info.is_lvalue = false;
-                    }
-                 }
-                 // Now AX holds the pointer value. Check if it's actually a pointer type.
-                 if let DataType::Ptr(target_type) = current_info.data_type {
-                     // AX holds the address *to be dereferenced*.
-                     // The result *is* an LValue (the memory location itself).
-                     // Store the load instruction for the *target* type.
-                     let target_load_instr = Some(if *target_type == DataType::Char { Instruction::Lc } else { Instruction::Li });
-                     expr_info = ExprInfo { data_type: *target_type, is_lvalue: true, lvalue_load_instr: target_load_instr };
-                     // Defer the load: AX holds the address. Load only when needed.
-                 } else {
-                      return Err(ParseError::InvalidDereference(token_info.line, token_info.column));
-                 }
-             }
-             Token::Ampersand => { // Address-of (&)
-                 // Address-of requires an LValue as operand
-                let inner_info = self.parse_expression_with_level(PREC_UNARY)?;
-                 if !inner_info.is_lvalue {
-                     return Err(ParseError::InvalidAddressOf(token_info.line, token_info.column));
-                 }
-                 // inner_info evaluation should have left the *address* in AX (e.g., via LEA or IMM).
-                 // The '&' operator means we *keep* that address. Do nothing except update type.
-                expr_info = ExprInfo {
-                    data_type: DataType::Ptr(Box::new(inner_info.data_type)),
-                    is_lvalue: false, // Result of & is an RValue (the address value itself)
-                    lvalue_load_instr: None,
-                 };
-             }
-             Token::Not => { // Logical NOT (!)
-                let mut inner_info = self.parse_expression_with_level(PREC_UNARY)?; // Expr -> AX (potentially address)
-                // Load if LValue
-                if inner_info.is_lvalue {
-                    if let Some(load_instr) = inner_info.lvalue_load_instr { self.emit(load_instr); inner_info.is_lvalue = false; }
-                }
-                // Now AX has value
-                self.emit_with_operand(Instruction::Imm, 0); // Load 0
-                self.emit(Instruction::Eq); // AX = (AX == 0) ? 1 : 0
-                expr_info = ExprInfo { data_type: DataType::Int, is_lvalue: false, lvalue_load_instr: None };
-             }
-            Token::BitNot => { // Bitwise NOT (~)
-                let mut inner_info = self.parse_expression_with_level(PREC_UNARY)?; // Expr -> AX
-                if inner_info.is_lvalue {
-                    if let Some(load_instr) = inner_info.lvalue_load_instr { self.emit(load_instr); inner_info.is_lvalue = false; }
-                }
-                self.emit_with_operand(Instruction::Imm, -1); // Load -1 (all bits set)
-                self.emit(Instruction::Xor); // AX = AX ^ -1
-                expr_info = ExprInfo { data_type: DataType::Int, is_lvalue: false, lvalue_load_instr: None }; // Assume Int result
-            }
-            Token::Add => { // Unary Plus (+) - No-op semantically, just ensure value is loaded
+                 if !inner_info.is_lvalue { return Err(ParseError::InvalidAddressOf(token_info.line, token_info.column)); }
+                expr_info = ExprInfo { data_type: DataType::Ptr(Box::new(inner_info.data_type)), is_lvalue: false, lvalue_load_instr: None }; }
+            Token::Not => { /* Existing Logical NOT (!) logic */
+                let mut inner_info = self.parse_expression_with_level(PREC_UNARY)?;
+                if inner_info.is_lvalue { if let Some(load_instr) = inner_info.lvalue_load_instr { self.emit(load_instr); inner_info.is_lvalue = false; inner_info.lvalue_load_instr = None; } else { return Err(ParseError::Other("Internal error: LValue operand for ! missing load instruction".into())); } }
+                self.emit_with_operand(Instruction::Imm, 0); self.emit(Instruction::Eq); expr_info = ExprInfo { data_type: DataType::Int, is_lvalue: false, lvalue_load_instr: None }; }
+            Token::BitNot => { /* Existing Bitwise NOT (~) logic */
+                let mut inner_info = self.parse_expression_with_level(PREC_UNARY)?;
+                if inner_info.is_lvalue { if let Some(load_instr) = inner_info.lvalue_load_instr { self.emit(load_instr); inner_info.is_lvalue = false; inner_info.lvalue_load_instr = None; } else { return Err(ParseError::Other("Internal error: LValue operand for ~ missing load instruction".into())); } }
+                self.emit_with_operand(Instruction::Imm, -1); self.emit(Instruction::Xor); expr_info = ExprInfo { data_type: DataType::Int, is_lvalue: false, lvalue_load_instr: None }; }
+            Token::Add => { /* Existing Unary Plus (+) logic */
                 expr_info = self.parse_expression_with_level(PREC_UNARY)?;
-                if expr_info.is_lvalue {
-                    if let Some(load_instr) = expr_info.lvalue_load_instr { self.emit(load_instr); expr_info.is_lvalue = false; }
-                }
-                // TODO: Perform integer promotion if type is char? C4 likely ignores.
-            }
-            Token::Sub => { // Unary Minus (-)
+                if expr_info.is_lvalue { if let Some(load_instr) = expr_info.lvalue_load_instr { self.emit(load_instr); expr_info.is_lvalue = false; expr_info.lvalue_load_instr = None; } else { return Err(ParseError::Other("Internal error: LValue operand for unary + missing load instruction".into())); } } }
+            Token::Sub => { /* Existing Unary Minus (-) logic */
                 expr_info = self.parse_expression_with_level(PREC_UNARY)?;
-                if expr_info.is_lvalue {
-                    if let Some(load_instr) = expr_info.lvalue_load_instr { self.emit(load_instr); expr_info.is_lvalue = false; }
-                }
-                // TODO: Type check - must be arithmetic type
-                self.emit(Instruction::Neg); // Negate value in AX
-                expr_info.is_lvalue = false; // Result is rvalue
-            }
-            Token::Inc | Token::Dec => { // Prefix ++/--
-                let op = token_info.token;
-                // Operand must be LValue
-                let inner_info = self.parse_expression_with_level(PREC_UNARY)?;
+                if expr_info.is_lvalue { if let Some(load_instr) = expr_info.lvalue_load_instr { self.emit(load_instr); expr_info.is_lvalue = false; expr_info.lvalue_load_instr = None; } else { return Err(ParseError::Other("Internal error: LValue operand for unary - missing load instruction".into())); } }
+                if !expr_info.data_type.is_int_or_char() { return Err(ParseError::TypeMismatch("Cannot apply unary minus to non-arithmetic type".into(), token_info.line, token_info.column)); }
+                self.emit(Instruction::Neg); expr_info.is_lvalue = false; }
+            Token::Inc | Token::Dec => { /* Existing Prefix ++/-- logic */
+                let op = token_info.token; let inner_info = self.parse_expression_with_level(PREC_UNARY)?;
                 if !inner_info.is_lvalue { return Err(ParseError::NotAnLValue("prefix ++/-- operand".into(), token_info.line, token_info.column)); }
-                let load_instr = inner_info.lvalue_load_instr.ok_or_else(|| ParseError::NotAnLValue("prefix ++/-- operand".into(), token_info.line, token_info.column))?;
-
-                // AX contains address.
-                self.emit(Instruction::Push); // push addr [S: addr]
-                self.emit(load_instr);        // LI/LC -> AX = value
-                self.emit(Instruction::Push); // push value [S: addr, value]
-                self.emit_with_operand(Instruction::Imm, 1); // Load 1
-                let element_type = inner_info.data_type.deref().unwrap_or(DataType::Char);
-                let is_ptr = inner_info.data_type.is_pointer();
-                if is_ptr { self.emit_pointer_scaling(element_type); } // Scale 1 if ptr
-                self.emit(if op == Token::Inc { Instruction::Add } else { Instruction::Sub }); // AX = value +/- scaled_1 (new_value)
-                // Store new_value into address. Needs addr on stack, value in AX.
-                // Stack: [addr, value]. AX = new_value.
-                self.emit_store(&inner_info.data_type)?; // Pops addr, stores AX (new_value). [S: value]
-                // Result of prefix is the *new* value, which is already in AX.
-                // Discard original value from stack.
-                self.emit_with_operand(Instruction::Adj, 1); // Discard original value. [S: ]
-
-                expr_info = ExprInfo { data_type: inner_info.data_type, is_lvalue: false, lvalue_load_instr: None }; // Result is rvalue
-            }
-
-
+                let load_instr = inner_info.lvalue_load_instr.ok_or_else(|| ParseError::NotAnLValue("prefix ++/-- operand load instr missing".into(), token_info.line, token_info.column))?;
+                self.emit(Instruction::Push); self.emit(load_instr); self.emit(Instruction::Push); self.emit_with_operand(Instruction::Imm, 1);
+                if inner_info.data_type.is_pointer() { let element_type = inner_info.data_type.deref().unwrap_or(DataType::Char); self.emit_pointer_scaling(element_type); }
+                self.emit(if op == Token::Inc { Instruction::Add } else { Instruction::Sub }); self.emit_store(&inner_info.data_type)?;
+                // Result of prefix is the new value, already in AX after store
+                expr_info = ExprInfo { data_type: inner_info.data_type, is_lvalue: false, lvalue_load_instr: None }; }
             // --- Error Cases ---
-             Token::Eof => return Err(ParseError::UnexpectedToken { expected: "primary expression".into(), found: token_info.token, line: token_info.line, column: token_info.column }),
-             _ => return Err(ParseError::UnexpectedToken { expected: "primary expression".into(), found: token_info.token, line: token_info.line, column: token_info.column }),
+            Token::Eof => return Err(ParseError::UnexpectedToken { expected: "primary expression".into(), found: token_info.token, line: token_info.line, column: token_info.column }),
+            _ => return Err(ParseError::UnexpectedToken { expected: "primary expression".into(), found: token_info.token, line: token_info.line, column: token_info.column }),
         }
 
-         // --- Handle Postfix Operators ---
-         loop {
-             match self.peek_token()? {
-                 Some(Token::LBracket) => { // Array indexing a[i]
-                     // Current expr_info holds base (e.g., pointer value or address of array)
-                     // If it's an LValue address, load the pointer value first.
-                     if expr_info.is_lvalue {
-                         if let Some(load_instr) = expr_info.lvalue_load_instr {
-                             self.emit(load_instr); // Load base pointer value -> AX
-                             expr_info.is_lvalue = false;
-                         }
-                     }
-                     // Now AX holds the base pointer value. Check type.
-                      if !expr_info.data_type.is_pointer() {
-                         let (l,c) = self.current_pos();
-                         return Err(ParseError::TypeMismatch("Attempting to index non-pointer type".into(), l, c));
-                      }
-                      let element_type = expr_info.data_type.deref().unwrap_or(DataType::Char);
+        // --- Handle Postfix Operators (Using `if let` loop structure) ---
+        loop {
+            // Peek using `if let`. The borrow for peek is confined here.
+            if let Some(Ok(peeked_info)) = self.tokens.peek() {
+                // Clone the token to release the borrow from peek immediately.
+                let cloned_token = peeked_info.token.clone();
 
-                     self.next_token()?; // Consume '['
-                     self.emit(Instruction::Push); // Push base pointer value
+                // Decide based on the *cloned* token. No borrow on self.tokens here.
+                match cloned_token {
+                    Token::LBracket | Token::LParen | Token::Inc | Token::Dec => {
+                        // It IS a postfix operator. Now it's safe to consume it.
+                        // This takes a fresh mutable borrow.
+                        let postfix_token_info = self.next_token()?;
 
-                     // Parse index expression
-                     let mut index_info = self.parse_expression_with_level(PREC_BOTTOM)?; // Index expr -> AX
-                     // Load index value if it's an LValue address
-                     if index_info.is_lvalue {
-                        if let Some(load_instr) = index_info.lvalue_load_instr { self.emit(load_instr); index_info.is_lvalue = false; }
-                     }
-                     self.expect_token(Token::RBracket, "']' to close array index")?;
+                        // --- Handle the specific postfix operator ---
+                        // (Use the *consumed* postfix_token_info)
+                        match postfix_token_info.token {
+                             Token::LBracket => { // Array indexing a[i]
+                                 // --- Array Indexing Logic --- (Same as before)
+                                 if expr_info.is_lvalue { if let Some(load_instr) = expr_info.lvalue_load_instr { self.emit(load_instr); expr_info.is_lvalue = false; expr_info.lvalue_load_instr = None; } else { let (l,c) = (postfix_token_info.line, postfix_token_info.column); return Err(ParseError::Other(format!("Internal error: LValue base for [] missing load instruction at {}:{}", l, c))); } }
+                                 if !expr_info.data_type.is_pointer() { let (l,c) = (postfix_token_info.line, postfix_token_info.column); return Err(ParseError::TypeMismatch("Attempting to index non-pointer type".into(), l, c)); }
+                                 let element_type = expr_info.data_type.deref().unwrap_or(DataType::Char);
+                                 self.emit(Instruction::Push); // Push base ptr value
+                                 let mut index_info = self.parse_expression_with_level(PREC_BOTTOM)?;
+                                 if index_info.is_lvalue { if let Some(load_instr) = index_info.lvalue_load_instr { self.emit(load_instr); index_info.is_lvalue = false; index_info.lvalue_load_instr = None; } else { let (l, c) = self.current_pos(); return Err(ParseError::Other(format!("Internal error: LValue index for [] missing load instruction near {}:{}", l, c))); } }
+                                 if !index_info.data_type.is_int_or_char() { let (l, c) = self.current_pos(); return Err(ParseError::TypeMismatch("Array index must be integer".into(), l, c)); }
+                                 self.expect_token(Token::RBracket, "']' to close array index")?;
+                                 self.emit_pointer_scaling(element_type.clone()); // Scale index in AX
+                                 self.emit(Instruction::Add); // AX = base_ptr + scaled_index (pops base_ptr)
+                                 let target_load_instr = Some(if element_type == DataType::Char { Instruction::Lc } else { Instruction::Li });
+                                 // Result is LValue (address)
+                                 expr_info = ExprInfo { data_type: element_type, is_lvalue: true, lvalue_load_instr: target_load_instr };
+                             }
+                             Token::LParen => { // Function call f(...)
+                                 // --- Function Call Logic --- (Same as before)
+                                 if expr_info.is_lvalue { if let Some(load_instr) = expr_info.lvalue_load_instr { self.emit(load_instr); expr_info.is_lvalue = false; expr_info.lvalue_load_instr = None; } else { let (l,c) = (postfix_token_info.line, postfix_token_info.column); return Err(ParseError::Other(format!("Internal error: LValue function target missing load instruction at {}:{}", l, c))); } }
+                                 // AX holds func address or syscall id
+                                 let func_target_type_info = expr_info.data_type.clone(); // Type info before call
+                                 let mut is_syscall = false; let mut syscall_instr: Option<Instruction> = None;
 
-                     // AX has index value, stack has base ptr. Emit code for `base + index * scale`
-                     self.emit_pointer_scaling(element_type.clone()); // Scale index in AX
-                     self.emit(Instruction::Add); // AX = base_addr + scaled_index
-                     // Result is the address of the element (LValue).
-                     let target_load_instr = Some(if element_type == DataType::Char { Instruction::Lc } else { Instruction::Li });
-                      expr_info = ExprInfo { data_type: element_type, is_lvalue: true, lvalue_load_instr: target_load_instr };
-                      // Defer the load. AX holds the element's address.
-                 }
-                 Some(Token::LParen) => { // Function call f(...)
-                    // Current expr_info holds function (address/ID or pointer value)
-                    // Load if LValue (e.g. pointer to function variable)
-                     if expr_info.is_lvalue {
-                         if let Some(load_instr) = expr_info.lvalue_load_instr {
-                             self.emit(load_instr); // Load function address/ID -> AX
-                             expr_info.is_lvalue = false;
-                         }
-                     }
-                     // Now AX holds function address/ID.
-                    let func_type = expr_info.data_type; // Type of the expression yielding the function ptr/ID
-                    // TODO: Check if func_type is actually callable? C4 is loose.
+                                 // Use original primary token info (passed implicitly via closure capture or explicit arg if refactored)
+                                 if let Token::Ident(ref name) = primary_token_info.token {
+                                     if let Some(sym) = self.symbol_table.find(name) {
+                                         if sym.class == SymbolClass::Sys {
+                                             is_syscall = true; syscall_instr = Instruction::try_from(sym.value as Value).ok();
+                                             if syscall_instr.is_none() { return Err(ParseError::Other(format!("Invalid opcode {} for syscall '{}' at {}:{}", sym.value, name, primary_token_info.line, primary_token_info.column))); }
+                                         }
+                                     }
+                                 }
+                                 if !is_syscall { self.emit(Instruction::Push); } // Push func address if regular call
+                                 // LParen already consumed
 
-                    self.next_token()?; // Consume '('
-                    self.emit(Instruction::Push); // Push func address/id
-                     expr_info = self.parse_function_call_args(func_type)?; // Parses args, emits pushes, emits CALL, ADJ
-                     // Result is RValue (return value in AX)
-                 }
-                  Some(Token::Inc | Token::Dec) => { // Postfix ++/--
-                      let op_token = self.next_token()?.token; // Consume ++ or --
-                      if !expr_info.is_lvalue { let (l,c) = self.current_pos(); return Err(ParseError::NotAnLValue("postfix ++/-- operand".into(), l, c)); }
-                      let load_instr = expr_info.lvalue_load_instr.ok_or_else(|| { let (l,c) = self.current_pos(); ParseError::NotAnLValue("postfix ++/-- operand".into(), l, c)})?;
+                                 // Determine return type based on whether it's syscall or regular call
+                                 let return_type = if is_syscall {
+                                      // Syscall 'type' in symbol table is the return type
+                                      func_target_type_info
+                                  } else {
+                                      // Regular function: type was Ptr(ReturnType)
+                                      func_target_type_info.deref().unwrap_or(DataType::Int) // Default to int if deref fails? Error?
+                                  };
 
-                      // AX has address
-                      self.emit(Instruction::Push); // Push addr [S: addr]
-                      self.emit(load_instr);        // LI/LC -> AX = value (original value)
-                      self.emit(Instruction::Push); // Push value (this is the result) [S: addr, value]
-                      self.emit_with_operand(Instruction::Imm, 1); // Load 1
-                      let element_type = expr_info.data_type.deref().unwrap_or(DataType::Char);
-                      let is_ptr = expr_info.data_type.is_pointer();
-                      if is_ptr { self.emit_pointer_scaling(element_type.clone()); } // Scale 1 if ptr
-                      // Add/Sub 1 to get new value. Stack: [addr, value], AX = scaled_1
-                      self.emit(if op_token == Token::Inc { Instruction::Add } else { Instruction::Sub }); // AX = value +/- scaled_1 (new_value)
-                      // Store new value back (pops addr from stack)
-                      self.emit_store(&expr_info.data_type)?; // Stores AX into Mem[addr]. [S: value]
+                                 let (return_expr_info, arg_count) = self.parse_function_call_args(return_type)?;
+                                 if let Some(instr) = syscall_instr { self.emit(instr); }
+                                 else {
+                                      self.emit(Instruction::Call); // Pops address
+                                      if arg_count > 0 { self.emit_with_operand(Instruction::Adj, arg_count as Value); } // Adjust stack for args
+                                 }
+                                 expr_info = return_expr_info; // Update expr_info with result
+                             }
+                             Token::Inc | Token::Dec => { // Postfix ++/--
+                                 // --- Postfix ++/-- Logic --- (Same as before)
+                                 let op_token = postfix_token_info.token;
+                                 if !expr_info.is_lvalue { let (l,c) = (postfix_token_info.line, postfix_token_info.column); return Err(ParseError::NotAnLValue("postfix ++/-- operand".into(), l, c)); }
+                                 let load_instr = expr_info.lvalue_load_instr.ok_or_else(|| { let (l,c) = (postfix_token_info.line, postfix_token_info.column); ParseError::Other(format!("Internal error: postfix ++/-- operand missing load instruction at {}:{}", l, c))})?;
+                                 let data_type = expr_info.data_type.clone();
 
-                      // Result is the *original* value, which is on the stack.
-                      // Use C4 recalculation method (assuming no direct SWAP or POP AX):
-                      self.emit(Instruction::Push); // Save new_value [S: value, new_value]
-                      self.emit_with_operand(Instruction::Imm, 1);
-                      if is_ptr { self.emit_pointer_scaling(element_type); }
-                      // Apply opposite operation to new_value to get original value
-                      self.emit(if op_token == Token::Inc { Instruction::Sub } else { Instruction::Add }); // AX = new_value -/+ scaled_1 = original_value
-                      // Discard saved new_value and original value from stack
-                      self.emit_with_operand(Instruction::Adj, 2); // Remove new_value and value [S: ]
-                      // Now AX has original value.
-
-                      expr_info.is_lvalue = false; // Result is rvalue
-                  }
-                 _ => break, // Not a postfix operator
-             }
-         } // End postfix loop
-
-         // If the expression resulted in an LValue (address in AX) but wasn't consumed
-         // by a postfix or upcoming binary operator requiring the address, load the value now.
-        if expr_info.is_lvalue {
-            // Check if the *next* token indicates a use that needs the address
-            let needs_addr = match self.peek_token()? {
-                Some(Token::Assign) => true, // Assignment needs address
-                // Add other ops needing address? Compound assignment?
-                _ => false,
-            };
-            if !needs_addr {
-                if let Some(load_instr) = expr_info.lvalue_load_instr {
-                    self.emit(load_instr); // LI / LC
-                    expr_info.is_lvalue = false; // Now it's the value (RValue)
+                                 // AX has address
+                                 self.emit(Instruction::Push); // [S: addr]
+                                 self.emit(load_instr);        // AX = orig_val
+                                 self.emit(Instruction::Push); // [S: addr, orig_val]
+                                 self.emit(Instruction::Push); // [S: addr, orig_val, orig_val] (Push value to save it)
+                                 self.emit_with_operand(Instruction::Imm, 1); // AX = 1
+                                 if data_type.is_pointer() { let element_type = data_type.deref().unwrap_or(DataType::Char); self.emit_pointer_scaling(element_type); } // AX = scaled_1
+                                 // Pop one orig_val, calc new_val
+                                 self.emit(if op_token == Token::Inc { Instruction::Add } else { Instruction::Sub }); // AX = orig_val + scaled_1 = new_val. [S: addr, orig_val]
+                                 self.emit_store(&data_type)?; // Pops addr, stores AX(new_val). [S: orig_val]
+                                 // Result of postfix is original value. Pop it into AX.
+                                 self.emit_with_operand(Instruction::Imm, 0); // AX = 0
+                                 self.emit(Instruction::Add); // AX = 0 + orig_val (pops orig_val). [S: ], AX = orig_val
+                                 // Result is RValue (original value)
+                                 expr_info = ExprInfo { data_type, is_lvalue: false, lvalue_load_instr: None };
+                             }
+                            _ => unreachable!("Inner match should only receive postfix ops due to outer match"),
+                        }
+                         // Successfully processed a postfix op, continue loop
+                    }
+                    _ => {
+                        // The cloned token was not a postfix operator
+                        break; // Exit the loop
+                    }
                 }
+            } else if let Some(Err(e)) = self.tokens.peek() {
+                // Peek resulted in a lexer error
+                return Err(ParseError::LexerError(e.clone()));
+            } else {
+                // Peek resulted in None (End Of Input)
+                break; // Exit the loop
             }
-         }
+        } // End postfix loop
+
+        // Final LValue load check happens in parse_expression_with_level after this returns
 
         Ok(expr_info)
     }
 
 
-    /// Parses function call arguments and emits CALL/ADJ.
-    /// Assumes function address/syscall ID is on the stack.
-    fn parse_function_call_args(&mut self, func_type: DataType) -> ParseResult<ExprInfo> {
-         // func_type might be Ptr(ReturnType) or just the ReturnType if we add Func types
-        let return_type = match func_type {
-            DataType::Ptr(inner) => *inner, // Assume pointer to function returns inner type
-            // If it's a built-in like printf, the symbol table gave its return type directly
-            other => other,
-        };
+    // --- Other methods like parse_function_call_args, parse_type, parse_cast_expression, map_add_error ---
+    // --- remain the same as in the previous working versions ---
 
-        let mut arg_count = 0;
-        let mut arg_codes: Vec<Vec<Value>> = Vec::new(); // Store code for each arg L->R
+    /// Parses function call arguments and emits PUSH instructions.
+    /// CALL/Syscall/ADJ are handled by the caller.
+    /// Returns the ExprInfo for the function's return value and the number of args pushed.
+    fn parse_function_call_args(&mut self, func_return_type: DataType) -> ParseResult<(ExprInfo, i64)> {
+        // (Keep existing logic for parsing args L->R, storing code, emitting PUSH R->L)
+        let return_type = func_return_type;
+        let mut arg_count: i64 = 0;
+        let mut arg_codes: Vec<Vec<Value>> = Vec::new();
 
-        // Parse arguments L->R, storing generated code temporarily
         if self.peek_token()? != Some(&Token::RParen) {
             loop {
-                 // Use a temporary buffer to capture code for this argument
-                 // This avoids interleaving argument code if args have side effects
                  let mut temp_code_buffer: Vec<Value> = Vec::new();
-                 let original_code = mem::take(&mut self.code); // Take ownership of main code
-                 mem::swap(&mut self.code, &mut temp_code_buffer); // Put temp buffer in self.code
+                 let original_code = mem::take(&mut self.code);
+                 mem::swap(&mut self.code, &mut temp_code_buffer); // Use temp buffer
 
-                 let mut arg_info = self.parse_expression_with_level(PREC_ASSIGN)?; // Parse one arg -> self.code (temp) has its code
-                 // Load arg value if it's an LValue address
-                 if arg_info.is_lvalue {
+                 let mut arg_info = self.parse_expression_with_level(PREC_ASSIGN)?; // Parse arg -> temp buffer
+                 if arg_info.is_lvalue { // Load arg value if it's an LValue
                      if let Some(load_instr) = arg_info.lvalue_load_instr {
-                         // Emit load into temp buffer (self.code)
-                         self.emit(load_instr);
-                         arg_info.is_lvalue = false;
+                         self.emit(load_instr); // Emit load into temp buffer
+                         arg_info.is_lvalue = false; arg_info.lvalue_load_instr = None;
+                     } else {
+                        mem::swap(&mut self.code, &mut temp_code_buffer); // Restore before error
+                        self.code = original_code;
+                        return Err(ParseError::Other("Internal error: LValue argument missing load instruction".into()));
                      }
                  }
-                 // TODO: Type check argument against function signature if available
 
-                 mem::swap(&mut self.code, &mut temp_code_buffer); // Swap back, temp_code_buffer has arg code
-                 self.code = original_code; // Restore original main code
+                 mem::swap(&mut self.code, &mut temp_code_buffer); // Swap back
+                 self.code = original_code; // Restore original
 
-                 arg_codes.push(temp_code_buffer); // Store the code generated for this arg
+                 arg_codes.push(temp_code_buffer);
                  arg_count += 1;
 
-                 if !self.consume_optional(Token::Comma)? { break; } // More args?
+                 if !self.consume_optional(Token::Comma)? { break; }
             }
         }
         self.expect_token(Token::RParen, "')' after function arguments")?;
 
-        // Emit argument code and PUSH instructions in REVERSE order (C calling convention)
+        // Emit argument code and PUSH instructions in REVERSE order
         for arg_code in arg_codes.iter().rev() {
-            self.code.extend_from_slice(arg_code); // Emit code for arg calculation -> AX
-            self.emit(Instruction::Push); // Push the result from AX
+            self.code.extend_from_slice(arg_code); // Emit arg calculation -> AX
+            self.emit(Instruction::Push);          // Push AX
         }
 
-        // Emit CALL (address/ID was pushed before parsing args)
-        self.emit(Instruction::Call); // Pops address/ID, jumps, pushes return addr
-
-        // Emit ADJ to clean up arguments from stack (caller cleanup)
-        if arg_count > 0 {
-            self.emit_with_operand(Instruction::Adj, arg_count as Value);
-        }
-
-        // Result is in AX, type is function return type
-        Ok(ExprInfo { data_type: return_type, is_lvalue: false, lvalue_load_instr: None })
+        Ok((
+            ExprInfo { data_type: return_type, is_lvalue: false, lvalue_load_instr: None },
+            arg_count
+        ))
     }
 
     /// Parses a type specifier (int, char, void, pointers) used in casts or sizeof.
     fn parse_type(&mut self) -> ParseResult<DataType> {
+        // (Keep existing logic)
         let base_type = match self.peek_token()? {
             Some(Token::Int) => { self.next_token()?; DataType::Int },
             Some(Token::Char) => { self.next_token()?; DataType::Char },
-            Some(Token::Void) => { self.next_token()?; DataType::Void }, // If Void token exists
+            Some(Token::Void) => { self.next_token()?; DataType::Void },
             _ => { let ti = self.next_token()?; return Err(ParseError::UnexpectedToken{expected:"type name (int, char, void)".into(), found:ti.token, line:ti.line, column:ti.column})}
         };
-        self.parse_pointers(base_type) // Parse subsequent '*'
+        self.parse_pointers(base_type)
     }
 
-     /// Parses a type cast expression `(type) expr`
+    /// Parses a type cast expression `(type) expr`
     fn parse_cast_expression(&mut self) -> ParseResult<ExprInfo> {
-        // LParen already consumed by caller (parse_primary)
+        // (Keep existing logic - assumes LParen was consumed by caller)
         let target_type = self.parse_type()?;
         self.expect_token(Token::RParen, "')' after type cast")?;
-
-        // Parse the expression being casted
         let mut inner_expr_info = self.parse_expression_with_level(PREC_UNARY)?;
-        // Load value if LValue address
-        if inner_expr_info.is_lvalue {
+        if inner_expr_info.is_lvalue { // Load value if needed
             if let Some(load_instr) = inner_expr_info.lvalue_load_instr {
-                 self.emit(load_instr);
-                 inner_expr_info.is_lvalue = false;
+                 self.emit(load_instr); inner_expr_info.is_lvalue = false; inner_expr_info.lvalue_load_instr = None;
+            } else {
+                 return Err(ParseError::Other("Internal error: LValue operand for cast missing load instruction".into()));
             }
         }
-
-         // In C4/simple C, casting often doesn't generate code, just changes compiler's view.
-         // No code emitted here, just update the type info. AX holds the value.
-         // TODO: Implement potential checks (e.g., casting non-int/ptr to pointer is dubious).
-        Ok(ExprInfo { data_type: target_type, is_lvalue: false, lvalue_load_instr: None }) // Cast result is rvalue
+        // Casting itself doesn't generate code, just updates type info. Result is RValue.
+        Ok(ExprInfo { data_type: target_type, is_lvalue: false, lvalue_load_instr: None })
     }
 
     /// Helper to map symbol table errors to ParseError::Redeclaration or Other.
-    /// Made static (associated function) to avoid borrow checker issues.
     fn map_add_error(symbol_error: String, name: &str, line: usize, column: usize) -> ParseError {
-        // Check if the error message indicates a redeclaration (adjust string if needed)
+        // (Keep existing logic)
         if symbol_error.contains("already defined") || symbol_error.contains("Redeclaration") {
             ParseError::Redeclaration(name.to_string(), line, column)
         } else {
@@ -1492,44 +1628,26 @@ impl<'a> Parser<'a> {
 
 } // impl Parser
 
-// Add helper extension trait for DataType if not already in symbol.rs or vm.rs
+// --- Add helper extension trait for DataType ---
+// This should ideally be in symbol.rs or shared, but ensure parser.rs can see it.
+// Make sure WORD_SIZE here matches the VM's VALUE_SIZE_BYTES if you redefine it.
+
 trait DataTypeExt {
     fn is_pointer(&self) -> bool;
     fn is_int_or_char(&self) -> bool;
     fn size(&self) -> i64; // Get size in bytes
+    fn alignment(&self) -> usize; // Get alignment requirement in bytes
     fn size_in_words(&self) -> i64; // Get size in VM words (for offsets/ENT)
     fn deref(&self) -> Option<DataType>; // Get type pointed to
 }
 
 impl DataTypeExt for DataType {
-    #[inline]
-    fn is_pointer(&self) -> bool { matches!(self, DataType::Ptr(_)) }
-
-    #[inline]
-    fn is_int_or_char(&self) -> bool { matches!(self, DataType::Int | DataType::Char) }
-
-    #[inline]
-    fn size(&self) -> i64 {
-        match self {
-            DataType::Char => 1,
-            // Assume Value is pointer-sized (e.g., 4 or 8 bytes)
-            DataType::Int | DataType::Ptr(_) => std::mem::size_of::<Value>() as i64,
-            DataType::Void => 0, // Or 1? C standard is ambiguous. C4 likely 0.
-        }
-    }
-     #[inline]
-    fn size_in_words(&self) -> i64 {
-        match self {
-            // C4 treats char as taking a full word slot on stack/locals for simplicity
-            DataType::Char | DataType::Int | DataType::Ptr(_) => 1,
-            DataType::Void => 0,
-        }
-    }
-     #[inline]
-     fn deref(&self) -> Option<DataType> {
-         match self {
-             DataType::Ptr(inner) => Some(*inner.clone()),
-             _ => None,
-         }
-     }
+     #[inline] fn is_pointer(&self) -> bool { matches!(self, DataType::Ptr(_)) }
+     #[inline] fn is_int_or_char(&self) -> bool { matches!(self, DataType::Int | DataType::Char) }
+     // Use WORD_SIZE consistently for Int/Ptr size
+     #[inline] fn size(&self) -> i64 { match self { DataType::Char => 1, DataType::Int | DataType::Ptr(_) => WORD_SIZE as i64, DataType::Void => 0 } }
+     #[inline] fn alignment(&self) -> usize { match self { DataType::Char => 1, DataType::Int | DataType::Ptr(_) => WORD_SIZE, DataType::Void => 1 } }
+     // Assuming VM treats char/int/ptr as taking 1 word slot on stack/locals
+     #[inline] fn size_in_words(&self) -> i64 { match self { DataType::Char | DataType::Int | DataType::Ptr(_) => 1, DataType::Void => 0 } }
+     #[inline] fn deref(&self) -> Option<DataType> { match self { DataType::Ptr(inner) => Some(*inner.clone()), _ => None } }
 }

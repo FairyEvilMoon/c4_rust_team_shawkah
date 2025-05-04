@@ -136,8 +136,8 @@ pub struct VirtualMachine {
     // State
     running: bool,
     code_size: usize,
-    memory_size_words: usize,  // Total size of `memory` in words
-    memory_size_bytes: usize,  // Total size of `memory` in bytes
+    pub memory_size_words: usize,  // Total size of `memory` in words
+    pub memory_size_bytes: usize,  // Total size of `memory` in bytes
 }
 
 

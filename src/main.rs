@@ -38,12 +38,6 @@ fn main() {
 
     println!("--- Compilation Successful ---");
     println!("Entry Point Address (word index): {}", entry_point); // Assuming entry_point is word index
-    // Optional: Print bytecode and data segment for debugging
-    // println!("Code size (words): {}", code.len());
-    // println!("Initial Data size (bytes): {}", data_segment.len());
-    // println!("Bytecode: {:?}", code);
-    // println!("Data Segment (bytes): {:?}", data_segment);
-    // println!("-----------------------------");
 
 
     // 3. VM Execution - Handle potential initialization error
@@ -57,10 +51,6 @@ fn main() {
     };
 
     println!("--- Running VM ---");
-    // Optional: Dump state before run (these are now called on the VirtualMachine instance)
-    // vm.dump_registers();
-    // vm.dump_heap(10); // Use dump_heap or dump_memory_section instead of dump_data_segment
-    // vm.dump_stack(10);
 
     match vm.run() { // Now calling run() on the actual VirtualMachine instance
         Ok(result) => {
@@ -73,9 +63,7 @@ fn main() {
         Err(e) => {
             eprintln!("\n--- VM Runtime Error ---");
             eprintln!("{}", e);
-            // Optional: Dump state on error (these are now called on the VirtualMachine instance)
             vm.dump_registers();
-            // vm.dump_heap(20); // Use dump_heap or dump_memory_section
             vm.dump_stack(20); // Show more stack on error
             process::exit(1);
         }

@@ -15,3 +15,8 @@ Rewrite the C4 compiler (lexer, parser, virtual machine) in Rust, ensuring it co
 *   Unit and integration tests.
 *   Documentation generated via `cargo doc`.
 *   **(Optional Bonus Feature)** => Support for exponentials was added to the newly created Rust code. Exponents can be calculated by using the ** operator.
+
+## Running the Compiler
+*  To run the compiler, you run the following:
+*  `cargo build`
+*  `cargo run -- <test_file_name.c>`

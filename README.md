@@ -14,4 +14,4 @@ Rewrite the C4 compiler (lexer, parser, virtual machine) in Rust, ensuring it co
 *   Written in idiomatic Rust with safety guarantees.
 *   Unit and integration tests.
 *   Documentation generated via `cargo doc`.
-*   **(Optional Bonus Feature)** [Describe bonus feature if implemented, e.g., Added support for basic floating-point arithmetic (float type, literals, +,-,*,/ operations)]
+*   **(Optional Bonus Feature)** => Support for exponentials was added to the newly created Rust code. Exponents can be calculated by using the ** operator.
